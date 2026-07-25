@@ -51,15 +51,19 @@ function isRateLimited(ip) {
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && origin !== ALLOWED_ORIGIN) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Visitor-Secret');
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
   }
+
+  if (origin && origin !== ALLOWED_ORIGIN) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
   next();
 });
 
