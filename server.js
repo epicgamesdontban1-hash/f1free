@@ -5,7 +5,6 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const DATA_FILE = path.join(__dirname, 'visitors.json');
 const VISITOR_SECRET = process.env.VISITOR_SECRET || 'CHANGE_ME_TO_A_RANDOM_SECRET';
 const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || 'https://freef1.netlify.app').replace(/\/$/, '');
 
@@ -14,45 +13,18 @@ function normalizeOrigin(origin) {
   return origin.replace(/\/$/, '');
 }
 
-const rateLimitMap = new Map();
+const activeUsers = new Map();
+const HEARTBEAT_TIMEOUT = 60000;
+const CLEANUP_INTERVAL = 30000;
 
-function readCount() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      return data.count || 0;
-    }
-  } catch (e) {
-    console.error('Error reading count:', e);
-  }
-  return 0;
-}
-
-function writeCount(count) {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ count }, null, 2));
-  } catch (e) {
-    console.error('Error writing count:', e);
-  }
-}
-
-function isRateLimited(ip) {
+setInterval(() => {
   const now = Date.now();
-  const windowMs = 60000;
-  const maxRequests = 10;
-
-  const record = rateLimitMap.get(ip) || { count: 0, resetAt: now + windowMs };
-
-  if (now > record.resetAt) {
-    record.count = 0;
-    record.resetAt = now + windowMs;
+  for (const [userId, lastSeen] of activeUsers.entries()) {
+    if (now - lastSeen > HEARTBEAT_TIMEOUT) {
+      activeUsers.delete(userId);
+    }
   }
-
-  record.count++;
-  rateLimitMap.set(ip, record);
-
-  return record.count > maxRequests;
-}
+}, CLEANUP_INTERVAL);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -72,23 +44,36 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use((req, res, next) => {
-  const clientIp = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
-  if (isRateLimited(clientIp)) {
-    return res.status(429).json({ error: 'Too many requests' });
-  }
-  next();
-});
-
-app.get('/api/visitors', (req, res) => {
+app.get('/api/visitors/heartbeat', (req, res) => {
   const secret = req.headers['x-visitor-secret'];
   if (secret !== VISITOR_SECRET) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
-  const count = readCount() + 1;
-  writeCount(count);
-  res.json({ count });
+  const userId = req.headers['x-user-id'];
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing user ID' });
+  }
+
+  activeUsers.set(userId, Date.now());
+  res.json({ active: activeUsers.size });
+});
+
+app.get('/api/visitors/active', (req, res) => {
+  const secret = req.headers['x-visitor-secret'];
+  if (secret !== VISITOR_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const now = Date.now();
+  let activeCount = 0;
+  for (const lastSeen of activeUsers.values()) {
+    if (now - lastSeen <= HEARTBEAT_TIMEOUT) {
+      activeCount++;
+    }
+  }
+
+  res.json({ active: activeCount });
 });
 
 app.get('/', (req, res) => {
