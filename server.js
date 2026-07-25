@@ -31,7 +31,7 @@ app.use((req, res, next) => {
 
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Visitor-Secret');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Visitor-Secret, X-User-Id');
 
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
