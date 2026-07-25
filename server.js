@@ -7,7 +7,12 @@ const PORT = process.env.PORT || 3000;
 
 const DATA_FILE = path.join(__dirname, 'visitors.json');
 const VISITOR_SECRET = process.env.VISITOR_SECRET || 'CHANGE_ME_TO_A_RANDOM_SECRET';
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://freef1.netlify.app';
+const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || 'https://freef1.netlify.app').replace(/\/$/, '');
+
+function normalizeOrigin(origin) {
+  if (!origin) return origin;
+  return origin.replace(/\/$/, '');
+}
 
 const rateLimitMap = new Map();
 
@@ -60,7 +65,7 @@ app.use((req, res, next) => {
     return res.sendStatus(204);
   }
 
-  if (origin && origin !== ALLOWED_ORIGIN) {
+  if (origin && normalizeOrigin(origin) !== ALLOWED_ORIGIN) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
