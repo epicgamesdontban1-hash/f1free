@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 3000;
 
 const VISITOR_SECRET = process.env.VISITOR_SECRET || 'CHANGE_ME_TO_A_RANDOM_SECRET';
 const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || 'https://freef1.netlify.app').replace(/\/$/, '');
+const AUTHORIZED_DOMAIN = 'freef1.netlify.app';
 
 function normalizeOrigin(origin) {
   if (!origin) return origin;
@@ -42,6 +43,28 @@ app.use((req, res, next) => {
   }
 
   next();
+});
+
+app.get('/api/auth/verify', (req, res) => {
+  const host = req.headers.host || '';
+  const origin = req.headers.origin || '';
+  const referer = req.headers.referer || '';
+  
+  const isAuthorized = 
+    origin.includes(AUTHORIZED_DOMAIN) ||
+    referer.includes(AUTHORIZED_DOMAIN) ||
+    host.includes('localhost') ||
+    host.includes('127.0.0.1');
+
+  if (isAuthorized) {
+    res.json({ authorized: true, domain: AUTHORIZED_DOMAIN });
+  } else {
+    res.status(403).json({ 
+      authorized: false, 
+      error: 'Unauthorized',
+      message: 'This website can only be accessed from ' + AUTHORIZED_DOMAIN
+    });
+  }
 });
 
 app.get('/api/visitors/heartbeat', (req, res) => {
