@@ -1,22 +1,66 @@
 'use strict';
 
-const express    = require('express');
-const session    = require('express-session');
-const fs         = require('fs');
-const path       = require('path');
-const http       = require('http');
+const express = require('express');
+const session = require('express-session');
+const fs      = require('fs');
+const path    = require('path');
 
 const app    = express();
-const SERVER = http.createServer(app);
 
-const PORT        = process.env.PORT        || 3000;
-const ADMIN_PORT  = process.env.ADMIN_PORT   || 3001;
-const ADMIN_USER  = process.env.ADMIN_USER   || 'admin';
-const ADMIN_PASS  = process.env.ADMIN_PASS   || 'admin';
-const ADMIN_SECRET= process.env.ADMIN_SECRET || 'freef1-admin-secret-change-me';
+const PORT           = process.env.PORT          || 3000;
+const ADMIN_USER     = process.env.ADMIN_USER    || 'admin';
+const ADMIN_PASS     = process.env.ADMIN_PASS    || 'admin';
+const ADMIN_SECRET   = process.env.ADMIN_SECRET  || 'freef1-admin-secret-change-me';
 const VISITOR_SECRET = process.env.VISITOR_SECRET || 'doggomc';
 const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || 'https://freef1.netlify.app').replace(/\/$/, '');
 const AUTHORIZED_DOMAIN = 'freef1.netlify.app';
+
+// Site root — set DEV_DIR to the folder containing your index.html
+// Render example: DEV_DIR=/opt/render/project/Development-FreeF1
+const DEV_DIR = resolveDir(process.env.DEV_DIR, [
+  path.join(__dirname, '..', 'Development - FreeF1'),
+  path.join(__dirname, 'Development - FreeF1'),
+  path.join(__dirname, '..', '..', 'Development - FreeF1'),
+  path.join(process.cwd(), 'Development - FreeF1'),
+  path.join(process.cwd(), '..', 'Development - FreeF1'),
+  path.join('/opt', 'render', 'project', 'Development - FreeF1'),
+  path.join('/opt', 'render', 'project', 'development-freef1'),
+  path.join('/opt', 'render', 'project', 'site'),
+  path.join(process.cwd(), 'public'),
+  path.join(process.cwd(), 'site'),
+  process.cwd()
+]);
+
+const ADMIN_DIR = resolveDir(process.env.ADMIN_DIR, [
+  path.join(__dirname, 'admin'),
+  path.join(process.cwd(), 'admin'),
+  path.join('/opt', 'render', 'project', 'admin')
+]);
+
+function resolveDir(envValue, candidates) {
+  if (envValue && fs.existsSync(envValue)) return envValue;
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return envValue || candidates[0];
+}
+
+function findIndexHtml(dir) {
+  if (!dir) return null;
+  const direct = path.join(dir, 'index.html');
+  if (fs.existsSync(direct)) return direct;
+  // Search one level deep for any index.html
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const nested = path.join(dir, entry.name, 'index.html');
+        if (fs.existsSync(nested)) return nested;
+      }
+    }
+  } catch (_) {}
+  return direct;
+}
 
 // ─────────────────────────────────────────────
 // DATA STORES
@@ -266,11 +310,24 @@ function getStats() {
 // STATIC FILES — Main site
 // ─────────────────────────────────────────────
 
-const DEV_DIR = path.join(__dirname, '..', 'Development - FreeF1');
+console.log(`[Config] DEV_DIR   = ${DEV_DIR}`);
+console.log(`[Config] ADMIN_DIR = ${ADMIN_DIR}`);
+console.log(`[Config] DEV_DIR exists: ${fs.existsSync(DEV_DIR)}`);
+console.log(`[Config] ADMIN_DIR exists: ${fs.existsSync(ADMIN_DIR)}`);
+
 app.use(express.static(DEV_DIR, { index: false }));
 
 app.get('/', (req, res) => {
-  res.sendFile(path.join(DEV_DIR, 'index.html'));
+  const indexPath = findIndexHtml(DEV_DIR);
+  if (!fs.existsSync(indexPath)) {
+    return res.status(404).send(
+      `<h1>404 — Site not found</h1>
+       <p>index.html not found under: ${DEV_DIR}</p>
+       <p>Resolved path: ${indexPath}</p>
+       <p>Set the <strong>DEV_DIR</strong> environment variable on Render to the folder containing your index.html</p>`
+    );
+  }
+  res.sendFile(indexPath);
 });
 
 // Auth verification (existing, kept intact)
@@ -311,8 +368,6 @@ app.get('/api/visitors/active', (req, res) => {
 // ─────────────────────────────────────────────
 // ADMIN — STATIC FILES & AUTHENTICATION
 // ─────────────────────────────────────────────
-
-const ADMIN_DIR = path.join(__dirname, 'admin');
 
 app.use('/admin', express.static(ADMIN_DIR, { index: false }));
 
@@ -442,19 +497,23 @@ app.get('/admin/api/events', (req, res) => {
 // ─────────────────────────────────────────────
 
 app.get('/admin', (req, res) => {
-  res.sendFile(path.join(ADMIN_DIR, 'index.html'));
+  const p = path.join(ADMIN_DIR, 'index.html');
+  if (!fs.existsSync(p)) return res.status(404).send(`<h1>404</h1><p>admin/index.html not found at: ${p}</p>`);
+  res.sendFile(p);
 });
 app.get('/admin/login', (req, res) => {
-  res.sendFile(path.join(ADMIN_DIR, 'index.html'));
+  const p = path.join(ADMIN_DIR, 'index.html');
+  if (!fs.existsSync(p)) return res.status(404).send(`<h1>404</h1><p>admin/index.html not found at: ${p}</p>`);
+  res.sendFile(p);
 });
 
 // ─────────────────────────────────────────────
 // SERVER STARTUP
 // ─────────────────────────────────────────────
 
-const mainServer = app.listen(PORT, () => {
-  console.log(`[Main]  Server running on http://localhost:${PORT}`);
-  console.log(`[Main]  Serving site from ${DEV_DIR}`);
-  console.log(`[Admin] Dashboard at http://localhost:${ADMIN_PORT}/admin`);
+app.listen(PORT, () => {
+  console.log(`[Server] Running on http://localhost:${PORT}`);
+  console.log(`[Main]  Site:  http://localhost:${PORT}/  (${DEV_DIR})`);
+  console.log(`[Admin] Panel: http://localhost:${PORT}/admin  (${ADMIN_DIR})`);
   console.log(`[Admin] Login: ${ADMIN_USER} / ${ADMIN_PASS}`);
 });
