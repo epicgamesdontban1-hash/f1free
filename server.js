@@ -150,6 +150,8 @@ const streamOverride = {
 
 // SSE clients for admin dashboard
 const sseClients = new Set();
+// SSE clients for public site (stream override only)
+const publicSseClients = new Set();
 
 // Heartbeat / cleanup settings
 const HEARTBEAT_TIMEOUT = Number(process.env.HEARTBEAT_TIMEOUT_MS || 60_000);
@@ -296,6 +298,17 @@ function broadcastSSE(event, data) {
       res.write(payload);
     } catch (_) {
       sseClients.delete(res);
+    }
+  }
+}
+
+function broadcastPublicSSE(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of publicSseClients) {
+    try {
+      res.write(payload);
+    } catch (_) {
+      publicSseClients.delete(res);
     }
   }
 }
@@ -611,6 +624,55 @@ app.get('/api/visitors/active', (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// PUBLIC — Stream status & SSE (no auth needed)
+// ─────────────────────────────────────────────
+
+// Public endpoint for the Netlify site to poll stream status
+app.get('/api/stream/status', (req, res) => {
+  res.json({
+    active: streamOverride.active,
+    url: streamOverride.url,
+    type: streamOverride.type,
+    startedAt: streamOverride.startedAt
+  });
+});
+
+// Public SSE endpoint — only sends stream_override / stream_update events (no visitor data)
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  publicSseClients.add(res);
+
+  // Send initial stream state
+  const initPayload = JSON.stringify(streamOverride.active ? {
+    active: streamOverride.active,
+    url: streamOverride.url,
+    type: streamOverride.type,
+    startedAt: streamOverride.startedAt
+  } : { active: false, url: null, type: null, startedAt: null });
+
+  res.write(`event: stream_override\ndata: ${initPayload}\n\n`);
+  res.write(`event: stream_update\ndata: ${initPayload}\n\n`);
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': heartbeat\n\n');
+    } catch (_) {
+      publicSseClients.delete(res);
+    }
+  }, 15_000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    publicSseClients.delete(res);
+  });
+});
+
+// ─────────────────────────────────────────────
 // ADMIN — STATIC FILES & AUTHENTICATION
 // ─────────────────────────────────────────────
 
@@ -681,6 +743,8 @@ app.post('/admin/api/stream/override', (req, res) => {
   broadcastSSE('stream_override', payload);
   broadcastSSE('stream_update', payload);
   broadcastSSE('stats', getStats());
+  broadcastPublicSSE('stream_override', payload);
+  broadcastPublicSSE('stream_update', payload);
 
   res.json({ success: true, override: payload });
 });
@@ -695,6 +759,8 @@ function stopStreamOverride(message) {
   broadcastSSE('stream_override', payload);
   broadcastSSE('stream_update', payload);
   broadcastSSE('stats', getStats());
+  broadcastPublicSSE('stream_override', payload);
+  broadcastPublicSSE('stream_update', payload);
 
   return { success: true, message, override: { active: false } };
 }
