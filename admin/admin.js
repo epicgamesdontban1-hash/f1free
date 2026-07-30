@@ -28,6 +28,11 @@ const logoutBtn      = $('logoutBtn');
 const navStatus      = $('navStatus');
 const onlineCountEl  = $('onlineCount');
 const uniqueCountEl  = $('uniqueCount');
+const overrideCountEl = $('overrideCount');
+const overrideSubEl   = $('overrideSub');
+const serverTimeEl    = $('serverTime');
+const serverDateEl    = $('serverDate');
+const tableBadge      = $('tableBadge');
 const visitorTableBody = $('visitorTableBody');
 const visitorEmpty   = $('visitorEmpty');
 const streamStatusEl = $('streamStatus');
@@ -42,6 +47,9 @@ const sysUptime         = $('sysUptime');
 const sysVisitorStore   = $('sysVisitorStore');
 const sysOverrideStatus = $('sysOverrideStatus');
 const sysNodeEnv        = $('sysNodeEnv');
+const sysSessionActive  = $('sysSessionActive');
+const sseStatus         = $('sseStatus');
+const streamBadge       = $('streamBadge');
 const toastContainer    = $('toastContainer');
 const connBarFill       = $('connBarFill');
 
@@ -182,10 +190,15 @@ function connectSSE() {
 }
 
 function updateConnectionBar(connected) {
-  if (!connBarFill) return;
-  connBarFill.style.width = connected ? '100%' : '0%';
-  connBarFill.classList.toggle('disconnected', !connected);
+  if (connBarFill) {
+    connBarFill.style.width = connected ? '100%' : '0%';
+    connBarFill.classList.toggle('disconnected', !connected);
+  }
   if (navStatus) navStatus.textContent = connected ? 'CONNECTED' : 'RECONNECTING…';
+  if (sseStatus) {
+    sseStatus.textContent = connected ? 'Connected' : 'Reconnecting…';
+    sseStatus.style.color = connected ? 'var(--green)' : 'var(--amber)';
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -200,8 +213,26 @@ function handleStatsUpdate(data) {
 }
 
 function updateStatCards(data) {
-  if (onlineCountEl)  onlineCountEl.textContent  = String(data.onlineCount ?? 0);
-  if (uniqueCountEl)  uniqueCountEl.textContent  = String(data.totalUnique ?? 0);
+  const online = data.onlineCount ?? 0;
+  if (onlineCountEl) onlineCountEl.textContent = String(online);
+  if (uniqueCountEl) uniqueCountEl.textContent = String(data.totalUnique ?? 0);
+
+  const override = data.override || { active: false };
+  if (overrideCountEl) {
+    overrideCountEl.textContent = override.active ? 'ON' : 'OFF';
+    overrideCountEl.classList.toggle('green', !override.active);
+    overrideCountEl.classList.toggle('red', !!override.active);
+  }
+  if (overrideSubEl) {
+    overrideSubEl.textContent = override.active
+      ? `${(override.type || 'custom').toUpperCase()} · ${formatTimeAgo(override.startedAt)}`
+      : 'No override active';
+  }
+  if (tableBadge) tableBadge.textContent = `● ${online} Live`;
+
+  const now = new Date();
+  if (serverTimeEl) serverTimeEl.textContent = now.toLocaleTimeString('en-GB');
+  if (serverDateEl) serverDateEl.textContent = now.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short' });
 }
 
 function updateStreamStatus(override) {
@@ -215,8 +246,12 @@ function updateStreamStatus(override) {
         <small>${escapeHtml(override.type || 'custom').toUpperCase()} · Started ${formatTimeAgo(override.startedAt)}</small>
       </div>
       <div class="time-ago">LIVE</div>`;
-    if (streamTypeLabel) streamTypeLabel.textContent = (override.type || 'custom').toUpperCase();
-    if (streamStartedLabel) streamStartedLabel.textContent = formatTimeAgo(override.startedAt);
+    if (streamTypeLabel) streamTypeLabel.textContent = `TYPE: ${(override.type || 'custom').toUpperCase()}`;
+    if (streamStartedLabel) streamStartedLabel.textContent = `STARTED: ${formatTimeAgo(override.startedAt)}`;
+    if (streamBadge) {
+      streamBadge.textContent = 'Override';
+      streamBadge.className = 'panel-badge live';
+    }
     overrideActive = true;
     updateStreamButtons(true);
   } else {
@@ -228,8 +263,12 @@ function updateStreamStatus(override) {
         <small>Default site feed is active · No override in effect</small>
       </div>
       <div class="time-ago">● LIVE</div>`;
-    if (streamTypeLabel) streamTypeLabel.textContent = 'NORMAL';
-    if (streamStartedLabel) streamStartedLabel.textContent = '—';
+    if (streamTypeLabel) streamTypeLabel.textContent = 'TYPE: NORMAL';
+    if (streamStartedLabel) streamStartedLabel.textContent = 'STARTED: —';
+    if (streamBadge) {
+      streamBadge.textContent = 'Normal';
+      streamBadge.className = 'panel-badge normal';
+    }
     overrideActive = false;
     updateStreamButtons(false);
   }
@@ -242,16 +281,18 @@ function updateStreamButtons(active) {
 }
 
 function updateSystemInfo(data) {
-  if (sysUptime) {
-    const elapsed = Math.floor((Date.now() - (data?.override?.startedAt || Date.now())) / 1000);
-    sysUptime.textContent = `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
+  const uptimeMs = data?.server?.uptimeMs ?? (data?.server?.startedAt ? Date.now() - data.server.startedAt : 0);
+  if (sysUptime) sysUptime.textContent = formatDuration(uptimeMs);
+  if (sysVisitorStore) {
+    const active = data?.activeSessions ?? data?.visitors?.length ?? 0;
+    sysVisitorStore.textContent = `${active} active / ${data?.totalUnique ?? '—'} unique`;
   }
-  if (sysVisitorStore) sysVisitorStore.textContent = `${data?.totalUnique ?? '—'} unique`;
   if (sysOverrideStatus) {
     sysOverrideStatus.textContent = data?.override?.active ? 'OVERRIDE' : 'NORMAL';
     sysOverrideStatus.style.color = data?.override?.active ? '#ff6b62' : 'var(--green)';
   }
-  if (sysNodeEnv) sysNodeEnv.textContent = (import.meta?.env?.MODE || 'production').toUpperCase();
+  if (sysSessionActive) sysSessionActive.textContent = isAdmin ? 'Yes' : 'No';
+  if (sysNodeEnv) sysNodeEnv.textContent = String(data?.server?.nodeEnv || 'production').toUpperCase();
 }
 
 // ─────────────────────────────────────────────
@@ -263,76 +304,88 @@ function updateVisitorTable(data) {
   const visitors = [...data.visitors].sort((a, b) => (b.lastSeen - a.lastSeen));
 
   if (visitors.length === 0) {
-    visitorTableBody.innerHTML = '';
-    if (visitorEmpty) visitorEmpty.style.display = '';
+    renderEmptyVisitors();
     return;
   }
-  if (visitorEmpty) visitorEmpty.style.display = 'none';
 
-  // Build a lookup by IP for incremental updates
+  // Remove the placeholder row before diffing real visitor rows.
+  visitorTableBody.querySelector('#visitorEmpty')?.remove();
+
+  // Build a lookup by visitor id/IP for incremental updates.
   const existingRows = new Map();
-  visitorTableBody.querySelectorAll('tr').forEach(tr => {
-    existingRows.set(tr.dataset.ip, tr);
+  visitorTableBody.querySelectorAll('tr[data-key]').forEach(tr => {
+    existingRows.set(tr.dataset.key, tr);
   });
 
-  const visibleIps = new Set();
+  const visibleKeys = new Set();
   visitors.forEach(v => {
-    const ip = v.ip;
-    visibleIps.add(ip);
-    const online = now - v.lastSeen <= 60000;
+    const key = v.id || v.ip || `${v.lastSeen}`;
+    visibleKeys.add(key);
+    const online = now - (v.lastSeen || 0) <= 60000;
     const flag = v.countryCode ? getFlag(v.countryCode) : '🌐';
     const countryDisplay = v.country || v.countryCode || 'Unknown';
     const deviceClass = v.deviceType ? `device-${v.deviceType.toLowerCase()}` : '';
-
-    if (existingRows.has(ip)) {
-      // Update existing row
-      const tr = existingRows.get(ip);
-      tr.querySelector('.status-pill').outerHTML = `
-        <td><span class="pill-sm ${online ? 'pill-online' : 'pill-offline'}">
-          <span class="${online ? 'dot-online' : 'dot-offline'}"></span>${online ? 'Online' : 'Offline'}
-        </span></td>`;
-      tr.querySelector('.page-cell').textContent = v.page || '/';
-      tr.querySelector('.timestamp-cell').textContent = formatTimeAgo(v.lastSeen);
-      tr.dataset.online = online ? '1' : '0';
-    } else {
-      // Insert new row at top
-      const tr = document.createElement('tr');
-      tr.dataset.ip = ip;
-      tr.dataset.online = online ? '1' : '0';
-      tr.className = 'fade-in';
-      tr.innerHTML = `
-        <td class="ip">${escapeHtml(ip)}</td>
+    const rowHtml = `
+        <td class="ip">${escapeHtml(v.ip || key)}</td>
         <td class="country"><span class="flag">${flag}</span>${escapeHtml(countryDisplay)}</td>
         <td>${escapeHtml(v.browser || '—')}</td>
         <td>${escapeHtml(v.os || '—')}</td>
         <td class="${deviceClass}">${escapeHtml(v.deviceType || '—')}</td>
         <td class="page-cell" title="${escapeHtml(v.page || '/')}">${escapeHtml(v.page || '/')}</td>
-        <td><span class="pill-sm ${online ? 'pill-online' : 'pill-offline'}">
+        <td class="status-cell"><span class="pill-sm status-pill ${online ? 'pill-online' : 'pill-offline'}">
           <span class="${online ? 'dot-online' : 'dot-offline'}"></span>${online ? 'Online' : 'Offline'}
         </span></td>
         <td class="timestamp-cell">${formatTimeAgo(v.lastSeen)}</td>`;
-      visitorTableBody.insertBefore(tr, visitorTableBody.firstChild);
+
+    if (existingRows.has(key)) {
+      const tr = existingRows.get(key);
+      tr.dataset.online = online ? '1' : '0';
+      tr.innerHTML = rowHtml;
+    } else {
+      const tr = document.createElement('tr');
+      tr.dataset.key = key;
+      tr.dataset.online = online ? '1' : '0';
+      tr.className = 'fade-in';
+      tr.innerHTML = rowHtml;
+      visitorTableBody.appendChild(tr);
     }
   });
 
-  // Remove rows no longer in visitor list
-  existingRows.forEach((tr, ip) => {
-    if (!visibleIps.has(ip)) tr.remove();
+  existingRows.forEach((tr, key) => {
+    if (!visibleKeys.has(key)) tr.remove();
   });
 
-  // Toggle empty state
-  if (visitorEmpty) visitorEmpty.style.display = visitorTableBody.children.length === 0 ? '' : 'none';
+  // Keep display order aligned with the sorted visitors array.
+  visitors.forEach(v => {
+    const key = v.id || v.ip || `${v.lastSeen}`;
+    const row = visitorTableBody.querySelector(`tr[data-key="${cssEscape(key)}"]`);
+    if (row) visitorTableBody.appendChild(row);
+  });
+}
+
+function renderEmptyVisitors() {
+  visitorTableBody.innerHTML = `
+    <tr id="visitorEmpty">
+      <td colspan="8"><div class="empty-state">Waiting for visitor data…</div></td>
+    </tr>`;
 }
 
 function handleVisitorUpdate(type, visitor) {
   if (!visitor || !currentStats) return;
-  const now = Date.now();
-  const idx = currentStats.visitors.findIndex(v => v.ip === visitor.ip);
-  if (idx >= 0) {
+  const key = visitor.id || visitor.ip;
+  const idx = currentStats.visitors.findIndex(v => (v.id || v.ip) === key);
+
+  if (type === 'offline') {
+    if (idx >= 0) currentStats.visitors.splice(idx, 1);
+  } else if (idx >= 0) {
     currentStats.visitors[idx] = { ...currentStats.visitors[idx], ...visitor };
   } else {
     currentStats.visitors.unshift(visitor);
   }
+
+  currentStats.onlineCount = currentStats.visitors.filter(v => Date.now() - (v.lastSeen || 0) <= 60000).length;
+  currentStats.activeSessions = currentStats.visitors.length;
+  currentStats.totalUnique = Math.max(currentStats.totalUnique || 0, currentStats.visitors.length);
   updateStatCards(currentStats);
   updateVisitorTable(currentStats);
 }
@@ -341,6 +394,7 @@ function handleStreamStatusUpdate(data) {
   if (!currentStats) return;
   currentStats.override = data;
   updateStreamStatus(data);
+  updateStatCards(currentStats);
 }
 
 function handleStreamOverrideUpdate(data) {
@@ -465,10 +519,10 @@ setInterval(pollStats, REFRESH_MS);
 // ─────────────────────────────────────────────
 setInterval(() => {
   if (!isAdmin) return;
-  if (currentStats?.override?.startedAt) {
-    const elapsed = Math.floor((Date.now() - currentStats.override.startedAt) / 1000);
-    if (sysUptime) sysUptime.textContent = `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
+  if (currentStats?.server?.startedAt && sysUptime) {
+    sysUptime.textContent = formatDuration(Date.now() - currentStats.server.startedAt);
   }
+  if (currentStats) updateStatCards(currentStats);
 }, 1000);
 
 // ─────────────────────────────────────────────
@@ -481,6 +535,22 @@ function escapeHtml(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.floor((ms || 0) / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (days) return `${days}d ${hours}h ${minutes}m`;
+  if (hours) return `${hours}h ${minutes}m ${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return CSS.escape(String(value));
+  return String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
 }
 
 function formatTimeAgo(ts) {
@@ -507,7 +577,12 @@ function getFlag(cc) {
 }
 
 function isValidUrl(str) {
-  try { new URL(str); return true; } catch (_) { return false; }
+  try {
+    const url = new URL(str);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch (_) {
+    return false;
+  }
 }
 
 // ─────────────────────────────────────────────
