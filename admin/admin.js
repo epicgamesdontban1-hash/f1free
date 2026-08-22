@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────
 const API_BASE   = '/admin/api';
 const SSE_URL    = `${API_BASE}/events`;
-const REFRESH_MS = 3000;
+const REFRESH_MS = 15000; // fallback only; live updates normally arrive over SSE
 
 // ─────────────────────────────────────────────
 // DOM REFS
@@ -60,8 +60,11 @@ let isAdmin      = false;
 let sse          = null;
 let sseConnected = false;
 let reconnectTimer = null;
+let reconnectDelay = 1500;
+let lastSseMessageAt = 0;
 let currentStats = null;
 let overrideActive = false;
+let previewUrl = '';
 
 // ─────────────────────────────────────────────
 // AUTH
@@ -92,6 +95,7 @@ function showDashboard() {
   authScreen.classList.add('hidden');
   appEl.classList.add('open');
   connectSSE();
+  pollStats();
 }
 
 async function handleLogin(e) {
@@ -144,6 +148,11 @@ logoutBtn.addEventListener('click', handleLogout);
 // ─────────────────────────────────────────────
 // SSE CONNECTION
 // ─────────────────────────────────────────────
+function readSseEvent(event) {
+  lastSseMessageAt = Date.now();
+  try { return JSON.parse(event.data); } catch (_) { return null; }
+}
+
 function connectSSE() {
   if (sseConnected) return;
   if (sse) { sse.close(); sse = null; }
@@ -152,40 +161,44 @@ function connectSSE() {
 
   sse.addEventListener('open', () => {
     sseConnected = true;
+    reconnectDelay = 1500;
+    lastSseMessageAt = Date.now();
     clearTimeout(reconnectTimer);
     updateConnectionBar(true);
   });
 
   sse.addEventListener('init', e => {
-    const data = JSON.parse(e.data);
-    handleStatsUpdate(data);
+    const data = readSseEvent(e);
+    if (data) handleStatsUpdate(data);
   });
 
   sse.addEventListener('stats', e => {
-    const data = JSON.parse(e.data);
-    handleStatsUpdate(data);
+    const data = readSseEvent(e);
+    if (data) handleStatsUpdate(data);
   });
 
   sse.addEventListener('visitor_update', e => {
-    const { type, visitor } = JSON.parse(e.data);
-    handleVisitorUpdate(type, visitor);
+    const data = readSseEvent(e);
+    if (data) handleVisitorUpdate(data.type, data.visitor);
   });
 
   sse.addEventListener('stream_update', e => {
-    const data = JSON.parse(e.data);
-    handleStreamStatusUpdate(data);
+    const data = readSseEvent(e);
+    if (data) handleStreamStatusUpdate(data);
   });
 
   sse.addEventListener('stream_override', e => {
-    const data = JSON.parse(e.data);
-    handleStreamOverrideUpdate(data);
+    const data = readSseEvent(e);
+    if (data) handleStreamOverrideUpdate(data);
   });
 
   sse.addEventListener('error', () => {
     sseConnected = false;
     updateConnectionBar(false);
-    sse.close();
-    reconnectTimer = setTimeout(() => { if (isAdmin) connectSSE(); }, 4000);
+    sse?.close();sse = null;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => { if (isAdmin && !document.hidden) connectSSE(); }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   });
 }
 
@@ -254,6 +267,7 @@ function updateStreamStatus(override) {
     }
     overrideActive = true;
     updateStreamButtons(true);
+    if (override.url && previewUrl !== override.url) renderStreamPreview(override.url, override.type);
   } else {
     streamStatusEl.className = 'stream-status active-normal';
     streamStatusEl.innerHTML = `
@@ -271,6 +285,7 @@ function updateStreamStatus(override) {
     }
     overrideActive = false;
     updateStreamButtons(false);
+    if (previewUrl) clearStreamPreview();
   }
 }
 
@@ -302,65 +317,48 @@ function updateVisitorTable(data) {
   if (!visitorTableBody || !data?.visitors) return;
   const now = Date.now();
   const visitors = [...data.visitors].sort((a, b) => (b.lastSeen - a.lastSeen));
+  if (!visitors.length) { renderEmptyVisitors(); return; }
 
-  if (visitors.length === 0) {
-    renderEmptyVisitors();
-    return;
-  }
-
-  // Remove the placeholder row before diffing real visitor rows.
-  visitorTableBody.querySelector('#visitorEmpty')?.remove();
-
-  // Build a lookup by visitor id/IP for incremental updates.
   const existingRows = new Map();
-  visitorTableBody.querySelectorAll('tr[data-key]').forEach(tr => {
-    existingRows.set(tr.dataset.key, tr);
-  });
+  visitorTableBody.querySelectorAll('tr[data-key]').forEach(row => existingRows.set(row.dataset.key, row));
+  const orderedRows = [];
 
-  const visibleKeys = new Set();
-  visitors.forEach(v => {
-    const key = v.id || v.ip || `${v.lastSeen}`;
-    visibleKeys.add(key);
-    const online = now - (v.lastSeen || 0) <= 60000;
-    const flag = v.countryCode ? getFlag(v.countryCode) : '🌐';
-    const countryDisplay = v.country || v.countryCode || 'Unknown';
-    const deviceClass = v.deviceType ? `device-${v.deviceType.toLowerCase()}` : '';
-    const rowHtml = `
-        <td class="ip">${escapeHtml(v.ip || key)}</td>
-        <td class="country"><span class="flag">${flag}</span>${escapeHtml(countryDisplay)}</td>
-        <td>${escapeHtml(v.browser || '—')}</td>
-        <td>${escapeHtml(v.os || '—')}</td>
-        <td class="${deviceClass}">${escapeHtml(v.deviceType || '—')}</td>
-        <td class="page-cell" title="${escapeHtml(v.page || '/')}">${escapeHtml(v.page || '/')}</td>
-        <td class="status-cell"><span class="pill-sm status-pill ${online ? 'pill-online' : 'pill-offline'}">
-          <span class="${online ? 'dot-online' : 'dot-offline'}"></span>${online ? 'Online' : 'Offline'}
-        </span></td>
-        <td class="timestamp-cell">${formatTimeAgo(v.lastSeen)}</td>`;
-
-    if (existingRows.has(key)) {
-      const tr = existingRows.get(key);
-      tr.dataset.online = online ? '1' : '0';
-      tr.innerHTML = rowHtml;
-    } else {
-      const tr = document.createElement('tr');
-      tr.dataset.key = key;
-      tr.dataset.online = online ? '1' : '0';
-      tr.className = 'fade-in';
-      tr.innerHTML = rowHtml;
-      visitorTableBody.appendChild(tr);
+  visitors.forEach(visitor => {
+    const key = String(visitor.id || visitor.ip || visitor.lastSeen);
+    const online = now - (visitor.lastSeen || 0) <= 60000;
+    const flag = visitor.countryCode ? getFlag(visitor.countryCode) : '🌐';
+    const country = visitor.country || visitor.countryCode || 'Unknown';
+    const device = String(visitor.deviceType || '—');
+    const deviceSlug = /^(mobile|tablet|desktop)$/i.test(device) ? device.toLowerCase() : 'unknown';
+    const signature = JSON.stringify([visitor.ip, country, visitor.countryCode, visitor.browser, visitor.os, device, visitor.page, online]);
+    let row = existingRows.get(key);
+    if (!row) {
+      row = document.createElement('tr');
+      row.dataset.key = key;
+      row.className = 'fade-in';
     }
+    row.dataset.online = online ? '1' : '0';
+    if (row.dataset.signature !== signature) {
+      row.dataset.signature = signature;
+      row.innerHTML = `
+        <td class="ip" data-label="IP Address">${escapeHtml(visitor.ip || key)}</td>
+        <td class="country" data-label="Location"><span class="flag">${flag}</span>${escapeHtml(country)}</td>
+        <td data-label="Browser">${escapeHtml(visitor.browser || '—')}</td>
+        <td data-label="OS">${escapeHtml(visitor.os || '—')}</td>
+        <td class="device-${deviceSlug}" data-label="Device">${escapeHtml(device)}</td>
+        <td class="page-cell" data-label="Page" title="${escapeHtml(visitor.page || '/')}">${escapeHtml(visitor.page || '/')}</td>
+        <td class="status-cell" data-label="Status"><span class="pill-sm status-pill ${online ? 'pill-online' : 'pill-offline'}"><span class="${online ? 'dot-online' : 'dot-offline'}"></span>${online ? 'Online' : 'Offline'}</span></td>
+        <td class="timestamp-cell" data-label="Last Seen">${formatTimeAgo(visitor.lastSeen)}</td>`;
+    } else {
+      const timeCell = row.querySelector('.timestamp-cell');
+      if (timeCell) timeCell.textContent = formatTimeAgo(visitor.lastSeen);
+    }
+    orderedRows.push(row);
   });
 
-  existingRows.forEach((tr, key) => {
-    if (!visibleKeys.has(key)) tr.remove();
-  });
-
-  // Keep display order aligned with the sorted visitors array.
-  visitors.forEach(v => {
-    const key = v.id || v.ip || `${v.lastSeen}`;
-    const row = visitorTableBody.querySelector(`tr[data-key="${cssEscape(key)}"]`);
-    if (row) visitorTableBody.appendChild(row);
-  });
+  const fragment = document.createDocumentFragment();
+  orderedRows.forEach(row => fragment.appendChild(row));
+  visitorTableBody.replaceChildren(fragment);
 }
 
 function renderEmptyVisitors() {
@@ -368,6 +366,16 @@ function renderEmptyVisitors() {
     <tr id="visitorEmpty">
       <td colspan="8"><div class="empty-state">Waiting for visitor data…</div></td>
     </tr>`;
+}
+
+function refreshVisitorTimes() {
+  if (!currentStats?.visitors?.length) return;
+  const visitors = new Map(currentStats.visitors.map(visitor => [String(visitor.id || visitor.ip || visitor.lastSeen), visitor]));
+  visitorTableBody.querySelectorAll('tr[data-key]').forEach(row => {
+    const visitor = visitors.get(row.dataset.key);
+    const cell = row.querySelector('.timestamp-cell');
+    if (visitor && cell) cell.textContent = formatTimeAgo(visitor.lastSeen);
+  });
 }
 
 function handleVisitorUpdate(type, visitor) {
@@ -398,13 +406,9 @@ function handleStreamStatusUpdate(data) {
 }
 
 function handleStreamOverrideUpdate(data) {
+  const changed = Boolean(data.active) !== overrideActive || (data.url || '') !== previewUrl;
   handleStreamStatusUpdate(data);
-  if (data.active && streamPreview) {
-    renderStreamPreview(data.url, data.type);
-  } else if (!data.active && streamPreview) {
-    clearStreamPreview();
-  }
-  showToast(data.active ? 'Stream override activated.' : 'Stream override deactivated — normal feed restored.', data.active ? 'warning' : 'success');
+  if (changed) showToast(data.active ? 'Stream override activated.' : 'Stream override deactivated — normal feed restored.', data.active ? 'warning' : 'success');
 }
 
 // ─────────────────────────────────────────────
@@ -476,16 +480,18 @@ async function returnToNormalStream() {
 }
 
 function renderStreamPreview(url, type) {
-  if (!streamPreview) return;
+  if (!streamPreview || !url || previewUrl === url) return;
+  previewUrl = url;
   if (type === 'youtube' || type === 'embed') {
-    streamPreview.innerHTML = `<iframe src="${escapeHtml(url)}" allow="autoplay; fullscreen" allowFullScreen sandbox="allow-scripts allow-same-origin"></iframe>`;
+    streamPreview.innerHTML = `<iframe src="${escapeHtml(url)}" allow="autoplay; fullscreen" allowFullScreen referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin"></iframe>`;
   } else if (type === 'mp4') {
-    streamPreview.innerHTML = `<video controls autoplay style="width:100%;height:100%;border-radius:var(--radius-sm)"><source src="${escapeHtml(url)}"></video>`;
+    streamPreview.innerHTML = `<video controls autoplay playsinline preload="metadata" style="width:100%;height:100%;border-radius:var(--radius-sm)"><source src="${escapeHtml(url)}"></video>`;
   }
 }
 
 function clearStreamPreview() {
   if (!streamPreview) return;
+  previewUrl = '';
   streamPreview.innerHTML = `
     <div class="placeholder">
       <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -503,13 +509,16 @@ normalStreamBtn?.addEventListener('click', returnToNormalStream);
 // ─────────────────────────────────────────────
 // POLL FALLBACK (in case SSE stalls)
 // ─────────────────────────────────────────────
-async function pollStats() {
-  if (!isAdmin) return;
+async function pollStats(force = false) {
+  if (!isAdmin || document.hidden) return;
+  if (!force && sseConnected && Date.now() - lastSseMessageAt < 60000) return;
   try {
-    const r = await fetch(`${API_BASE}/visitors`);
-    const data = await r.json();
-    handleStatsUpdate(data);
-  } catch (_) { /* ignore poll errors */ }
+    const response = await fetch(`${API_BASE}/visitors`, { cache: 'no-store' });
+    if (response.status === 401) { showLogin(); return; }
+    if (!response.ok) return;
+    handleStatsUpdate(await response.json());
+    lastSseMessageAt = Date.now();
+  } catch (_) { /* EventSource/retry UI already reports connectivity. */ }
 }
 
 setInterval(pollStats, REFRESH_MS);
@@ -518,11 +527,12 @@ setInterval(pollStats, REFRESH_MS);
 // UPTIME CLOCK
 // ─────────────────────────────────────────────
 setInterval(() => {
-  if (!isAdmin) return;
-  if (currentStats?.server?.startedAt && sysUptime) {
-    sysUptime.textContent = formatDuration(Date.now() - currentStats.server.startedAt);
-  }
-  if (currentStats) updateStatCards(currentStats);
+  if (!isAdmin || document.hidden) return;
+  const now = new Date();
+  if (serverTimeEl) serverTimeEl.textContent = now.toLocaleTimeString('en-GB');
+  if (serverDateEl) serverDateEl.textContent = now.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short' });
+  if (currentStats?.server?.startedAt && sysUptime) sysUptime.textContent = formatDuration(Date.now() - currentStats.server.startedAt);
+  refreshVisitorTimes();
 }, 1000);
 
 // ─────────────────────────────────────────────
@@ -546,11 +556,6 @@ function formatDuration(ms) {
   if (days) return `${days}d ${hours}h ${minutes}m`;
   if (hours) return `${hours}h ${minutes}m ${seconds}s`;
   return `${minutes}m ${seconds}s`;
-}
-
-function cssEscape(value) {
-  if (window.CSS?.escape) return CSS.escape(String(value));
-  return String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
 }
 
 function formatTimeAgo(ts) {
@@ -609,13 +614,10 @@ function showToast(message, type = 'info') {
 // INIT
 // ─────────────────────────────────────────────
 checkAuthStatus();
-
-// Auto-refresh stream preview from current state on load
-setTimeout(async () => {
-  if (!isAdmin) return;
-  try {
-    const r = await fetch(`${API_BASE}/stream/status`);
-    const d = await r.json();
-    if (d.active && streamPreview) renderStreamPreview(d.url, d.type);
-  } catch (_) {}
-}, 800);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && isAdmin) {
+    if (!sseConnected) connectSSE();
+    pollStats(true);
+  }
+}, { passive: true });
+addEventListener('pagehide', () => { sse?.close(); }, { once: true });
