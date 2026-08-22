@@ -1042,10 +1042,12 @@ app.use('/admin', express.static(ADMIN_DIR, {
   index: false,
   fallthrough: true,
   etag: true,
-  maxAge: process.env.NODE_ENV === 'production' ? '1d' : 0,
-  setHeaders(res, filePath) {
-    if (/\.html?$/i.test(filePath)) res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
-    else res.setHeader('Cache-Control', 'private, max-age=3600, must-revalidate');
+  maxAge: 0,
+  setHeaders(res) {
+    // The dashboard HTML, CSS and JS are deployed together and must never get
+    // out of sync. Revalidate every admin asset instead of running stale JS
+    // against newer controls.
+    res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
   }
 }));
 
@@ -1235,6 +1237,7 @@ function sendAdminIndex(req, res) {
   if (!fs.existsSync(adminIndex)) {
     return res.status(404).send(`<h1>404</h1><p>admin/index.html not found at: ${escapeServerHtml(adminIndex)}</p>`);
   }
+  res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
   res.sendFile(adminIndex);
 }
 

@@ -110,6 +110,7 @@ function showDashboard() {
   appEl.classList.add('open');
   connectSSE();
   pollStats();
+  loadMaintenanceStatus();
 }
 
 async function handleLogin(e) {
@@ -501,8 +502,39 @@ function handleMaintenanceUpdate(data) {
 // ─────────────────────────────────────────────
 // WEBSITE MODE CONTROL
 // ─────────────────────────────────────────────
+async function loadMaintenanceStatus(notifyOnError = false) {
+  if (!maintenanceToggleBtn) return false;
+  maintenanceToggleBtn.disabled = true;
+  maintenanceToggleBtn.textContent = 'Checking Website Mode…';
+
+  try {
+    const response = await fetch(`${API_BASE}/maintenance`, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' }
+    });
+    if (response.status === 401) {
+      showLogin();
+      return false;
+    }
+    const data = await response.json();
+    if (!response.ok || !data.maintenance) throw new Error(data.error || 'Website mode endpoint is unavailable.');
+    if (currentStats) currentStats.maintenance = data.maintenance;
+    updateMaintenanceStatus(data.maintenance);
+    return true;
+  } catch (error) {
+    maintenanceStateKnown = false;
+    maintenanceToggleBtn.disabled = false;
+    maintenanceToggleBtn.classList.remove('is-active');
+    maintenanceToggleBtn.textContent = 'Retry Website Mode';
+    if (maintenanceNote) maintenanceNote.textContent = 'Could not verify the current website mode. Click Retry instead of using an unconfirmed state.';
+    if (notifyOnError) showToast(error.message || 'Could not load website mode.', 'error');
+    return false;
+  }
+}
+
 async function toggleMaintenanceMode() {
-  if (!maintenanceStateKnown || !maintenanceToggleBtn) return;
+  if (!maintenanceToggleBtn) return;
+  if (!maintenanceStateKnown && !(await loadMaintenanceStatus(true))) return;
   const nextActive = !maintenanceActive;
   const message = maintenanceMessage?.value.trim() || "We'll be back before the race.";
 
@@ -514,6 +546,7 @@ async function toggleMaintenanceMode() {
   try {
     const response = await fetch(`${API_BASE}/maintenance`, {
       method: 'POST',
+      cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ active: nextActive, message })
     });
