@@ -72,6 +72,11 @@
           <div class="stat-value red" id="overrideCount">OFF</div>
           <div class="stat-sub" id="overrideSub">No override active</div>
         </div>
+        <div class="stat-card accent-purple" id="maintenanceStatCard">
+          <div class="stat-label">Website Mode</div>
+          <div class="stat-value green" id="maintenanceCount">LIVE</div>
+          <div class="stat-sub" id="maintenanceSub">Public site is available</div>
+        </div>
         <div class="stat-card accent-amber">
           <div class="stat-label">Server Time</div>
           <div class="stat-value amber" id="serverTime">--:--:--</div>
@@ -113,6 +118,36 @@
 
         <!-- Right Column: Stream + System -->
         <div style="display:flex;flex-direction:column;gap:20px">
+
+          <!-- Website Mode Panel -->
+          <div class="panel maintenance-control" id="maintenancePanel">
+            <div class="panel-head">
+              <div class="panel-title">Website Mode</div>
+              <div class="panel-badge normal" id="maintenanceBadge">Live</div>
+            </div>
+            <div class="maintenance-panel">
+              <div class="maintenance-status is-live" id="maintenanceStatus">
+                <div class="race-lights" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+                <div class="status-text">
+                  <strong id="maintenanceStatusTitle">Public Site Live</strong>
+                  <small id="maintenanceStatusText">Visitors can access the full APEX experience.</small>
+                </div>
+              </div>
+
+              <div class="form-group" style="margin-bottom:0">
+                <label for="maintenanceMessage">Maintenance Page Message</label>
+                <input class="url-input" type="text" id="maintenanceMessage" maxlength="180"
+                  value="We'll be back before the race."
+                  placeholder="We'll be back before the race.">
+              </div>
+              <div class="url-hint">Shown underneath “We’re changing the tires” · 180 characters maximum</div>
+
+              <button class="btn-sm btn-maintenance" id="maintenanceToggleBtn" type="button" aria-pressed="false">
+                Enable Maintenance Mode
+              </button>
+              <p class="maintenance-note" id="maintenanceNote">Activation is instant. Open visitors will be sent to the pit-stop page automatically.</p>
+            </div>
+          </div>
 
           <!-- Stream Control Panel -->
           <div class="panel">
@@ -191,6 +226,10 @@
               <div class="system-item">
                 <span class="sys-key">Override Mode</span>
                 <span class="sys-val" id="sysOverrideStatus" style="color:var(--green)">NORMAL</span>
+              </div>
+              <div class="system-item">
+                <span class="sys-key">Public Website</span>
+                <span class="sys-val" id="sysMaintenanceStatus" style="color:var(--green)">LIVE</span>
               </div>
               <div class="system-item">
                 <span class="sys-key">Session Active</span>

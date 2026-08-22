@@ -339,6 +339,58 @@ td .pill-sm {
 .btn-ghost:hover { border-color: var(--border-2); color: var(--text); }
 .btn-ghost:disabled { opacity: .4; pointer-events: none; }
 
+/* ─── Maintenance Control ─────────────────────────────── */
+.maintenance-control { position: relative; }
+.maintenance-control.mode-active {
+  border-color: rgba(225,6,0,.34);
+  box-shadow: 0 0 42px -28px var(--red-glow);
+}
+.maintenance-panel { display: flex; flex-direction: column; gap: 14px; padding: 20px; }
+.maintenance-status {
+  display: flex; align-items: center; gap: 13px;
+  min-height: 68px; padding: 13px 14px; border-radius: var(--radius-sm);
+  background: var(--green-bg); border: 1px solid rgba(0,213,126,.2);
+  transition: background .3s var(--ease), border-color .3s var(--ease);
+}
+.maintenance-status.is-active {
+  background: rgba(225,6,0,.07); border-color: rgba(225,6,0,.26);
+}
+.maintenance-status .status-text strong { color: var(--green); }
+.maintenance-status.is-active .status-text strong { color: #ff6b62; }
+.race-lights {
+  flex: 0 0 auto; display: grid; grid-template-columns: repeat(5, 8px); gap: 4px;
+  padding: 9px 8px; border: 1px solid var(--border); border-radius: 7px;
+  background: #050608; box-shadow: inset 0 0 12px rgba(0,0,0,.8);
+}
+.race-lights i {
+  width: 8px; height: 8px; border-radius: 50%; background: #17372c;
+  box-shadow: 0 0 0 1px rgba(255,255,255,.05);
+}
+.maintenance-status.is-active .race-lights i {
+  background: var(--red); box-shadow: 0 0 8px var(--red);
+  animation: maintenanceLight 1.3s ease-in-out infinite alternate;
+}
+.maintenance-status.is-active .race-lights i:nth-child(2) { animation-delay: .1s; }
+.maintenance-status.is-active .race-lights i:nth-child(3) { animation-delay: .2s; }
+.maintenance-status.is-active .race-lights i:nth-child(4) { animation-delay: .3s; }
+.maintenance-status.is-active .race-lights i:nth-child(5) { animation-delay: .4s; }
+@keyframes maintenanceLight { to { opacity: .35; } }
+.btn-maintenance {
+  width: 100%; min-height: 44px; color: #fff; background: var(--red);
+  border-color: var(--red); box-shadow: 0 6px 18px -8px var(--red-glow);
+}
+.btn-maintenance:hover { background: #f01400; transform: translateY(-1px); }
+.btn-maintenance.is-active {
+  color: #04110b; background: var(--green); border-color: var(--green);
+  box-shadow: 0 6px 18px -9px rgba(0,213,126,.8);
+}
+.btn-maintenance.is-active:hover { background: #19e891; }
+.btn-maintenance:disabled { opacity: .5; pointer-events: none; }
+.maintenance-note {
+  color: var(--dim); font-family: var(--mono); font-size: .61rem;
+  line-height: 1.55; letter-spacing: .03em;
+}
+
 /* ─── Stream Preview ──────────────────────────────────── */
 .stream-preview {
   background: rgba(0,0,0,.3); border: 1px solid var(--border);
@@ -483,5 +535,5 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(-
 @media (prefers-reduced-motion:reduce) {
   html{scroll-behavior:auto}
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
-  .nav-brand .dot,.dot-online,.status-indicator.override{animation:none!important}
+  .nav-brand .dot,.dot-online,.status-indicator.override,.maintenance-status.is-active .race-lights i{animation:none!important}
 }

@@ -1,8 +1,10 @@
 'use strict';
 
 const crypto = require('crypto');
+const compression = require('compression');
 const express = require('express');
 const session = require('express-session');
+const MemoryStore = require('memorystore')(session);
 const fs = require('fs');
 const path = require('path');
 
@@ -18,7 +20,18 @@ const ADMIN_PASS = process.env.ADMIN_PASS || 'admin';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'freef1-admin-secret-change-me';
 const VISITOR_SECRET = process.env.VISITOR_SECRET || 'doggomc';
 const AUTHORIZED_DOMAIN = process.env.AUTHORIZED_DOMAIN || 'freef1.netlify.app';
+const AUTHORIZED_HOSTNAME = String(AUTHORIZED_DOMAIN).replace(/^https?:\/\//i, '').split('/')[0].split(':')[0].toLowerCase();
 const ALLOWED_ORIGINS = parseOrigins(process.env.ALLOWED_ORIGIN || 'https://freef1.netlify.app');
+
+// Durable unique-visitor storage. Upstash's REST API is intentionally used
+// directly so this stays dependency-free and works on every Render plan.
+const UNIQUE_VISITOR_BASELINE = Math.max(0, Number.parseInt(process.env.UNIQUE_VISITOR_BASELINE || '0', 10) || 0);
+const UNIQUE_VISITOR_REDIS_KEY = process.env.UNIQUE_VISITOR_REDIS_KEY || 'freef1:unique-visitors:v1';
+const MAINTENANCE_REDIS_KEY = process.env.MAINTENANCE_REDIS_KEY || 'freef1:maintenance:v1';
+const UNIQUE_VISITOR_HASH_SECRET = process.env.UNIQUE_VISITOR_HASH_SECRET || ADMIN_SECRET;
+const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
+const UPSTASH_REDIS_REST_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || '');
+const UNIQUE_VISITOR_REMOTE_ENABLED = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
 
 // Site root — set DEV_DIR to the folder containing your index.html
 // Render example: DEV_DIR=/opt/render/project/Development-FreeF1
@@ -89,6 +102,16 @@ function normalizeOrigin(value) {
   }
 }
 
+function hostnameFromUrl(value) {
+  if (!value) return '';
+  try { return new URL(value).hostname.toLowerCase(); } catch (_) { return ''; }
+}
+
+function isAuthorizedHostname(value) {
+  const hostname = String(value || '').split(':')[0].toLowerCase();
+  return hostname === AUTHORIZED_HOSTNAME;
+}
+
 function getRequestOrigin(req) {
   const origin = normalizeOrigin(req.headers.origin || '');
   if (origin) return origin;
@@ -138,7 +161,21 @@ function safeEqual(a, b) {
 
 // visitorKey -> { id, ip, country, city, browser, os, deviceType, page, connectedAt, lastSeen, online, source }
 const activeUsers = new Map();
+// Only keyed hashes are retained for unique counting; raw browser IDs/IPs are
+// never sent to the durable store.
 const visitorKeysSeen = new Set();
+const persistedVisitorHashes = new Set();
+const pendingUniqueWrites = new Map();
+let persistentUniqueCount = 0;
+let uniqueVisitorStoreReady = !UNIQUE_VISITOR_REMOTE_ENABLED;
+let lastUniqueStoreWarningAt = 0;
+// O(1) IP lookups avoid scanning every active visitor on each heartbeat.
+const visitorKeyByIp = new Map();
+// Geo responses are reused and concurrent lookups for one IP are deduplicated.
+const geoCache = new Map();
+const pendingGeoLookups = new Map();
+const loginAttempts = new Map();
+const GEO_CACHE_TTL = Number(process.env.GEO_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 
 // Stream override state
 const streamOverride = {
@@ -148,10 +185,28 @@ const streamOverride = {
   startedAt: null
 };
 
+const DEFAULT_MAINTENANCE_MESSAGE = "We'll be back before the race.";
+const maintenanceMode = {
+  active: false,
+  message: DEFAULT_MAINTENANCE_MESSAGE,
+  startedAt: null,
+  updatedAt: null
+};
+let maintenanceStoreReady = !UNIQUE_VISITOR_REMOTE_ENABLED;
+let maintenanceInitPromise = Promise.resolve(false);
+
 // SSE clients for admin dashboard
 const sseClients = new Set();
 // SSE clients for public site (stream override only)
 const publicSseClients = new Set();
+
+// One shared timer scales better than allocating a timer per connected SSE client.
+const sseHeartbeatTimer = setInterval(() => {
+  const heartbeat = ': heartbeat\n\n';
+  writeSSE(sseClients, heartbeat);
+  writeSSE(publicSseClients, heartbeat);
+}, 15_000);
+sseHeartbeatTimer.unref?.();
 
 // Heartbeat / cleanup settings
 const HEARTBEAT_TIMEOUT = Number(process.env.HEARTBEAT_TIMEOUT_MS || 60_000);
@@ -161,6 +216,25 @@ const GEO_API = process.env.GEO_API || 'http://ip-api.com/json';
 // ─────────────────────────────────────────────
 // MIDDLEWARE
 // ─────────────────────────────────────────────
+
+app.use(compression({
+  threshold: 1024,
+  filter(req, res) {
+    // Streaming responses must never be buffered by a compressor.
+    if (req.path.endsWith('/events') || String(req.headers.accept || '').includes('text/event-stream')) return false;
+    return compression.filter(req, res);
+  }
+}));
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+  if (req.path.startsWith('/api/') || req.path.startsWith('/admin/api/') || req.path === '/healthz') {
+    res.setHeader('Cache-Control', 'no-store');
+  }
+  next();
+});
 
 app.use((req, res, next) => {
   const origin = normalizeOrigin(req.headers.origin || '');
@@ -186,8 +260,11 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '64kb' }));
 
-// Session for admin (memory store; cleared on server restart)
+// Expiring in-memory store suits a single Render instance without the leak warning
+// of express-session's default store. Set up a shared store when scaling to many instances.
+const sessionStore = new MemoryStore({ checkPeriod: 15 * 60 * 1000 });
 const sessionMiddleware = session({
+  store: sessionStore,
   secret: ADMIN_SECRET,
   name: 'freef1.sid',
   resave: false,
@@ -291,31 +368,36 @@ function classifyStreamURL(url) {
 // UTILITY — SSE Broadcast
 // ─────────────────────────────────────────────
 
-function broadcastSSE(event, data) {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of sseClients) {
-    try {
-      res.write(payload);
-    } catch (_) {
-      sseClients.delete(res);
-    }
+function writeSSE(clients, payload) {
+  for (const res of clients) {
+    if (res.destroyed || res.writableEnded) { clients.delete(res); continue; }
+    try { res.write(payload); } catch (_) { clients.delete(res); }
   }
+}
+
+function broadcastSSE(event, data) {
+  if (!sseClients.size) return;
+  writeSSE(sseClients, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function broadcastPublicSSE(event, data) {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of publicSseClients) {
-    try {
-      res.write(payload);
-    } catch (_) {
-      publicSseClients.delete(res);
-    }
-  }
+  if (!publicSseClients.size) return;
+  writeSSE(publicSseClients, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function broadcastVisitorChange(type, visitor) {
+let statsBroadcastTimer = null;
+function scheduleStatsBroadcast(delay = 80) {
+  if (!sseClients.size || statsBroadcastTimer) return;
+  statsBroadcastTimer = setTimeout(() => {
+    statsBroadcastTimer = null;
+    broadcastSSE('stats', getStats());
+  }, delay);
+  statsBroadcastTimer.unref?.();
+}
+
+function broadcastVisitorChange(type, visitor, includeStats = true) {
   broadcastSSE('visitor_update', { type, visitor: sanitizeVisitor(visitor) });
-  broadcastSSE('stats', getStats());
+  if (includeStats) scheduleStatsBroadcast();
 }
 
 // ─────────────────────────────────────────────
@@ -330,18 +412,234 @@ function isPublicIp(ip) {
   return true;
 }
 
+function pruneGeoCache() {
+  const now = Date.now();
+  for (const [ip, cached] of geoCache) if (cached.expiresAt <= now) geoCache.delete(ip);
+  while (geoCache.size > 5000) geoCache.delete(geoCache.keys().next().value);
+}
+
 async function lookupGeo(ip) {
   if (!isPublicIp(ip) || typeof fetch !== 'function') return null;
+  const cached = geoCache.get(ip);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (pendingGeoLookups.has(ip)) return pendingGeoLookups.get(ip);
+
+  const lookup = (async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    timeout.unref?.();
+    try {
+      const res = await fetch(`${GEO_API}/${encodeURIComponent(ip)}?fields=status,city,country,countryCode,lat,lon,query&timeout=3000`, { signal: controller.signal });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.status !== 'success') return null;
+      geoCache.set(ip, { value: data, expiresAt: Date.now() + GEO_CACHE_TTL });
+      if (geoCache.size > 5000) pruneGeoCache();
+      return data;
+    } catch (_) {
+      return null;
+    } finally {
+      clearTimeout(timeout);
+      pendingGeoLookups.delete(ip);
+    }
+  })();
+
+  pendingGeoLookups.set(ip, lookup);
+  return lookup;
+}
+
+// ─────────────────────────────────────────────
+// DURABLE UNIQUE-VISITOR COUNT
+// ─────────────────────────────────────────────
+
+function hashVisitorKey(key) {
+  return crypto
+    .createHmac('sha256', UNIQUE_VISITOR_HASH_SECRET)
+    .update(String(key || 'unknown'))
+    .digest('hex');
+}
+
+function warnUniqueStore(error) {
+  const now = Date.now();
+  if (now - lastUniqueStoreWarningAt < 60_000) return;
+  lastUniqueStoreWarningAt = now;
+  console.warn(`[Visitors] Durable store unavailable; keeping the last confirmed total. ${error?.message || error}`);
+}
+
+async function upstashRequest(commands) {
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) throw new Error('Upstash is not configured');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+  timeout.unref?.();
 
   try {
-    const res = await fetch(`${GEO_API}/${encodeURIComponent(ip)}?fields=status,city,country,countryCode,lat,lon,query&timeout=3000`);
-    if (!res.ok) return null;
-    const d = await res.json();
-    if (d.status === 'success') return d;
-  } catch (_) {
-    // Silently skip geo if API is unreachable/rate-limited.
+    const isPipeline = Array.isArray(commands[0]);
+    const response = await fetch(`${UPSTASH_REDIS_REST_URL}${isPipeline ? '/pipeline' : ''}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(commands),
+      cache: 'no-store',
+      signal: controller.signal
+    });
+
+    if (!response.ok) throw new Error(`Upstash HTTP ${response.status}`);
+    const payload = await response.json();
+    if (payload?.error) throw new Error(payload.error);
+    if (Array.isArray(payload)) {
+      const failed = payload.find(item => item?.error);
+      if (failed) throw new Error(failed.error);
+    }
+    return payload;
+  } finally {
+    clearTimeout(timeout);
   }
-  return null;
+}
+
+async function syncUniqueVisitorCount() {
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) return false;
+  try {
+    const payload = await upstashRequest(['SCARD', UNIQUE_VISITOR_REDIS_KEY]);
+    const count = Number(payload?.result);
+    if (!Number.isFinite(count) || count < 0) throw new Error('Upstash returned an invalid visitor count');
+    persistentUniqueCount = count;
+    uniqueVisitorStoreReady = true;
+    scheduleStatsBroadcast();
+    return true;
+  } catch (error) {
+    warnUniqueStore(error);
+    return false;
+  }
+}
+
+async function trackUniqueVisitor(key) {
+  const hash = hashVisitorKey(key);
+  const firstSeenThisProcess = !visitorKeysSeen.has(hash);
+  visitorKeysSeen.add(hash);
+
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) return firstSeenThisProcess;
+  if (persistedVisitorHashes.has(hash)) return false;
+  if (pendingUniqueWrites.has(hash)) return pendingUniqueWrites.get(hash);
+
+  const write = (async () => {
+    try {
+      // SADD is atomic: two simultaneous requests for one browser can never
+      // increment the permanent total twice. SCARD returns the authoritative
+      // count after the write, including visitors recorded by another process.
+      const payload = await upstashRequest([
+        ['SADD', UNIQUE_VISITOR_REDIS_KEY, hash],
+        ['SCARD', UNIQUE_VISITOR_REDIS_KEY]
+      ]);
+      const added = Number(payload?.[0]?.result) === 1;
+      const count = Number(payload?.[1]?.result);
+      if (!Number.isFinite(count) || count < 0) throw new Error('Upstash returned an invalid visitor count');
+
+      persistedVisitorHashes.add(hash);
+      persistentUniqueCount = count;
+      uniqueVisitorStoreReady = true;
+      if (added) scheduleStatsBroadcast();
+      return added;
+    } catch (error) {
+      warnUniqueStore(error);
+      return false;
+    } finally {
+      pendingUniqueWrites.delete(hash);
+    }
+  })();
+
+  pendingUniqueWrites.set(hash, write);
+  return write;
+}
+
+function getTotalUniqueVisitors() {
+  if (UNIQUE_VISITOR_REMOTE_ENABLED) {
+    return UNIQUE_VISITOR_BASELINE + persistentUniqueCount;
+  }
+  return UNIQUE_VISITOR_BASELINE + visitorKeysSeen.size;
+}
+
+function normalizeMaintenanceMessage(value) {
+  const message = String(value || '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+  return message || DEFAULT_MAINTENANCE_MESSAGE;
+}
+
+function publicMaintenanceState() {
+  return {
+    active: Boolean(maintenanceMode.active),
+    message: normalizeMaintenanceMessage(maintenanceMode.message),
+    startedAt: maintenanceMode.startedAt || null,
+    updatedAt: maintenanceMode.updatedAt || null
+  };
+}
+
+function applyMaintenanceState(state) {
+  const active = Boolean(state?.active);
+  maintenanceMode.active = active;
+  maintenanceMode.message = normalizeMaintenanceMessage(state?.message);
+  maintenanceMode.startedAt = active ? (Number(state?.startedAt) || Date.now()) : null;
+  maintenanceMode.updatedAt = Number(state?.updatedAt) || Date.now();
+  return publicMaintenanceState();
+}
+
+async function syncMaintenanceState() {
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) {
+    maintenanceStoreReady = true;
+    return false;
+  }
+
+  try {
+    const payload = await upstashRequest(['GET', MAINTENANCE_REDIS_KEY]);
+    if (payload?.result) {
+      const stored = JSON.parse(payload.result);
+      applyMaintenanceState(stored);
+    }
+    maintenanceStoreReady = true;
+    scheduleStatsBroadcast();
+    return true;
+  } catch (error) {
+    warnUniqueStore(error);
+    maintenanceStoreReady = false;
+    return false;
+  }
+}
+
+async function persistMaintenanceState() {
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) return false;
+  try {
+    const payload = await upstashRequest([
+      'SET',
+      MAINTENANCE_REDIS_KEY,
+      JSON.stringify(publicMaintenanceState())
+    ]);
+    if (payload?.result !== 'OK') throw new Error('Upstash did not confirm the maintenance update');
+    maintenanceStoreReady = true;
+    return true;
+  } catch (error) {
+    warnUniqueStore(error);
+    maintenanceStoreReady = false;
+    return false;
+  }
+}
+
+// Keep the local snapshot in sync if the service is ever scaled beyond one
+// process. This is a single lightweight request every five minutes.
+const uniqueVisitorSyncTimer = UNIQUE_VISITOR_REMOTE_ENABLED
+  ? setInterval(syncUniqueVisitorCount, 5 * 60 * 1000)
+  : null;
+uniqueVisitorSyncTimer?.unref?.();
+if (UNIQUE_VISITOR_REMOTE_ENABLED) {
+  syncUniqueVisitorCount();
+  maintenanceInitPromise = syncMaintenanceState();
+} else if (UPSTASH_REDIS_REST_URL || UPSTASH_REDIS_REST_TOKEN) {
+  console.warn('[Visitors] Both UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are required; unique totals and maintenance mode are in-memory only.');
+} else {
+  console.warn('[Visitors] Upstash is not configured; unique totals and maintenance mode will reset when the server restarts.');
 }
 
 // ─────────────────────────────────────────────
@@ -364,9 +662,9 @@ function normalizeVisitorId(value) {
 }
 
 function findVisitorKeyByIp(ip) {
-  for (const [key, visitor] of activeUsers) {
-    if (visitor.ip === ip) return key;
-  }
+  const key = visitorKeyByIp.get(ip);
+  if (key && activeUsers.has(key)) return key;
+  if (key) visitorKeyByIp.delete(ip);
   return null;
 }
 
@@ -418,7 +716,7 @@ function upsertVisitor(key, req, options = {}) {
       source: options.source || 'page'
     };
     activeUsers.set(key, entry);
-    visitorKeysSeen.add(key);
+    if (ip && ip !== 'unknown') visitorKeyByIp.set(ip, key);
 
     lookupGeo(ip).then(geo => {
       if (!geo || !activeUsers.has(key)) return;
@@ -426,7 +724,7 @@ function upsertVisitor(key, req, options = {}) {
       current.country = geo.country || null;
       current.city = geo.city || null;
       current.countryCode = geo.countryCode || null;
-      broadcastVisitorChange('geo', current);
+      broadcastVisitorChange('geo', current, false);
     });
   } else {
     entry.ip = entry.ip || ip;
@@ -437,6 +735,7 @@ function upsertVisitor(key, req, options = {}) {
     entry.lastSeen = now;
     entry.online = true;
     entry.source = options.source || entry.source || 'page';
+    if (entry.ip && entry.ip !== 'unknown') visitorKeyByIp.set(entry.ip, key);
   }
 
   return { entry, isNew };
@@ -460,7 +759,9 @@ function visitorTracking(req, res, next) {
     source: 'page'
   });
 
-  broadcastVisitorChange(isNew ? 'online' : 'update', entry);
+  // Never hold up page delivery for remote analytics storage.
+  trackUniqueVisitor(key).catch(warnUniqueStore);
+  broadcastVisitorChange(isNew ? 'online' : 'update', entry, isNew);
   next();
 }
 
@@ -472,14 +773,18 @@ app.use(visitorTracking);
 
 function cleanupInactiveVisitors() {
   const now = Date.now();
-  for (const [id, v] of activeUsers) {
-    if (now - v.lastSeen > HEARTBEAT_TIMEOUT) {
-      v.online = false;
-      broadcastSSE('visitor_update', { type: 'offline', visitor: sanitizeVisitor(v) });
+  for (const [key, state] of loginAttempts) if (state.resetAt <= now) loginAttempts.delete(key);
+  let removed = 0;
+  for (const [id, visitor] of activeUsers) {
+    if (now - visitor.lastSeen > HEARTBEAT_TIMEOUT) {
+      visitor.online = false;
+      broadcastSSE('visitor_update', { type: 'offline', visitor: sanitizeVisitor(visitor) });
       activeUsers.delete(id);
+      if (visitorKeyByIp.get(visitor.ip) === id) visitorKeyByIp.delete(visitor.ip);
+      removed++;
     }
   }
-  broadcastSSE('stats', getStats());
+  if (removed) scheduleStatsBroadcast();
 }
 
 setInterval(cleanupInactiveVisitors, CLEANUP_INTERVAL).unref?.();
@@ -504,6 +809,12 @@ function sanitizeVisitor(v) {
   };
 }
 
+function countOnlineUsers(now = Date.now()) {
+  let count = 0;
+  for (const visitor of activeUsers.values()) if (now - visitor.lastSeen <= HEARTBEAT_TIMEOUT) count++;
+  return count;
+}
+
 function getStats() {
   const now = Date.now();
   let onlineCount = 0;
@@ -520,7 +831,7 @@ function getStats() {
   return {
     onlineCount,
     activeSessions: activeUsers.size,
-    totalUnique: visitorKeysSeen.size,
+    totalUnique: getTotalUniqueVisitors(),
     visitors,
     override: streamOverride.active ? {
       active: true,
@@ -528,10 +839,17 @@ function getStats() {
       type: streamOverride.type,
       startedAt: streamOverride.startedAt
     } : { active: false },
+    maintenance: publicMaintenanceState(),
     server: {
       startedAt: SERVER_STARTED_AT,
       uptimeMs: now - SERVER_STARTED_AT,
-      nodeEnv: process.env.NODE_ENV || 'development'
+      nodeEnv: process.env.NODE_ENV || 'development',
+      uniqueVisitorStore: UNIQUE_VISITOR_REMOTE_ENABLED
+        ? (uniqueVisitorStoreReady ? 'upstash' : 'upstash-connecting')
+        : 'memory',
+      maintenanceStore: UNIQUE_VISITOR_REMOTE_ENABLED
+        ? (maintenanceStoreReady ? 'upstash' : 'upstash-connecting')
+        : 'memory'
     }
   };
 }
@@ -540,56 +858,87 @@ function getStats() {
 // STATIC FILES — Main site
 // ─────────────────────────────────────────────
 
+const SITE_INDEX_PATH = findIndexHtml(DEV_DIR);
+const SITE_INDEX_EXISTS = Boolean(SITE_INDEX_PATH && fs.existsSync(SITE_INDEX_PATH));
+const MAINTENANCE_PAGE_PATH = SITE_INDEX_PATH
+  ? path.join(path.dirname(SITE_INDEX_PATH), 'maintenance.html')
+  : path.join(DEV_DIR, 'maintenance.html');
+
 console.log(`[Config] DEV_DIR   = ${DEV_DIR}`);
 console.log(`[Config] ADMIN_DIR = ${ADMIN_DIR}`);
 console.log(`[Config] DEV_DIR exists: ${fs.existsSync(DEV_DIR)}`);
 console.log(`[Config] ADMIN_DIR exists: ${fs.existsSync(ADMIN_DIR)}`);
 console.log(`[Config] Allowed origins: ${ALLOWED_ORIGINS.join(', ') || '(same-origin/local only)'}`);
 
+// Intercept the explicit index path before static middleware so maintenance
+// mode cannot be bypassed when this server is also serving the public site.
+app.get('/index.html', sendSiteIndex);
+
 app.use(express.static(DEV_DIR, {
   index: false,
   fallthrough: true,
-  maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0
+  etag: true,
+  lastModified: true,
+  maxAge: process.env.NODE_ENV === 'production' ? '7d' : 0,
+  setHeaders(res, filePath) {
+    if (/\.html?$/i.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+    else if (/\.(?:css|m?js)$/i.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
+    else if (filePath.includes(`${path.sep}assets${path.sep}`)) res.setHeader('Cache-Control', 'public, max-age=2592000');
+  }
 }));
 
 app.get('/healthz', (req, res) => {
-  res.json({ ok: true, uptimeMs: Date.now() - SERVER_STARTED_AT });
+  res.json({
+    ok: true,
+    uptimeMs: Date.now() - SERVER_STARTED_AT,
+    uniqueVisitorStore: UNIQUE_VISITOR_REMOTE_ENABLED
+      ? (uniqueVisitorStoreReady ? 'upstash' : 'upstash-connecting')
+      : 'memory',
+    maintenanceStore: UNIQUE_VISITOR_REMOTE_ENABLED
+      ? (maintenanceStoreReady ? 'upstash' : 'upstash-connecting')
+      : 'memory'
+  });
 });
 
-function sendSiteIndex(req, res) {
-  const indexPath = findIndexHtml(DEV_DIR);
-  if (!indexPath || !fs.existsSync(indexPath)) {
+async function sendSiteIndex(req, res, next) {
+  try {
+    await maintenanceInitPromise;
+    if (maintenanceMode.active && fs.existsSync(MAINTENANCE_PAGE_PATH)) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Retry-After', '600');
+      return res.status(503).sendFile(MAINTENANCE_PAGE_PATH);
+    }
+  } catch (error) {
+    return next(error);
+  }
+
+  if (!SITE_INDEX_EXISTS) {
     return res.status(404).send(
       `<h1>404 — Site not found</h1>
        <p>index.html not found under: ${escapeServerHtml(DEV_DIR)}</p>
-       <p>Resolved path: ${escapeServerHtml(indexPath || '(none)')}</p>
+       <p>Resolved path: ${escapeServerHtml(SITE_INDEX_PATH || '(none)')}</p>
        <p>Set the <strong>DEV_DIR</strong> environment variable on Render to the folder containing your index.html.</p>`
     );
   }
-  res.sendFile(indexPath);
+  res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+  res.sendFile(SITE_INDEX_PATH);
 }
 
 app.get('/', sendSiteIndex);
 
 // Auth verification (existing public endpoint, with same-origin/local support)
 app.get('/api/auth/verify', (req, res) => {
-  const host = req.headers.host || '';
-  const origin = req.headers.origin || '';
-  const referer = req.headers.referer || '';
-  const sourceOrigin = normalizeOrigin(origin || referer || '');
+  const origin = normalizeOrigin(req.headers.origin || '');
+  const referer = normalizeOrigin(req.headers.referer || '');
   const requestOrigin = getRequestOrigin(req);
-
+  const sourceOrigin = origin || referer;
   const isAuthorized =
-    origin.includes(AUTHORIZED_DOMAIN) ||
-    referer.includes(AUTHORIZED_DOMAIN) ||
-    host.includes('localhost') ||
-    host.includes('127.0.0.1') ||
+    isAuthorizedHostname(req.hostname) ||
+    isAuthorizedHostname(hostnameFromUrl(origin)) ||
+    isAuthorizedHostname(hostnameFromUrl(referer)) ||
     isLocalOrigin(requestOrigin) ||
-    (sourceOrigin && (
-      ALLOWED_ORIGINS.includes(sourceOrigin) ||
-      isSameOriginRequest(req, sourceOrigin) ||
-      isLocalOrigin(sourceOrigin)
-    ));
+    isLocalOrigin(sourceOrigin) ||
+    Boolean(sourceOrigin && (ALLOWED_ORIGINS.includes(sourceOrigin) || isSameOriginRequest(req, sourceOrigin)));
 
   if (isAuthorized) return res.json({ authorized: true, domain: AUTHORIZED_DOMAIN });
   res.status(403).json({ authorized: false, error: 'Unauthorized', message: 'Access only from ' + AUTHORIZED_DOMAIN });
@@ -597,35 +946,51 @@ app.get('/api/auth/verify', (req, res) => {
 
 // Visitor heartbeat used by the public site. It now updates the same object shape
 // as page tracking instead of corrupting the admin visitor map with raw numbers.
-app.get('/api/visitors/heartbeat', (req, res) => {
-  const secret = req.headers['x-visitor-secret'];
-  if (secret !== VISITOR_SECRET) return res.status(403).json({ error: 'Forbidden' });
+app.get('/api/visitors/heartbeat', async (req, res, next) => {
+  try {
+    const secret = req.headers['x-visitor-secret'];
+    if (!safeEqual(secret, VISITOR_SECRET)) return res.status(403).json({ error: 'Forbidden' });
 
-  const suppliedUserId = normalizeVisitorId(req.headers['x-user-id']);
-  if (!suppliedUserId) return res.status(400).json({ error: 'Missing user ID' });
+    const suppliedUserId = normalizeVisitorId(req.headers['x-user-id']);
+    if (!suppliedUserId) return res.status(400).json({ error: 'Missing user ID' });
 
-  const ip = getClientIp(req);
-  const existingIpKey = findVisitorKeyByIp(ip);
-  const key = activeUsers.has(suppliedUserId) ? suppliedUserId : (existingIpKey || suppliedUserId);
-  const { entry, isNew } = upsertVisitor(key, req, {
-    page: pageFromReferer(req, activeUsers.get(key)?.page || '/'),
-    source: 'heartbeat',
-    keepExistingPage: !req.headers.referer
-  });
+    const ip = getClientIp(req);
+    const existingIpKey = findVisitorKeyByIp(ip);
+    const key = activeUsers.has(suppliedUserId) ? suppliedUserId : (existingIpKey || suppliedUserId);
+    const { entry, isNew } = upsertVisitor(key, req, {
+      page: pageFromReferer(req, activeUsers.get(key)?.page || '/'),
+      source: 'heartbeat',
+      keepExistingPage: !req.headers.referer
+    });
+    const isGloballyNew = await trackUniqueVisitor(key);
 
-  broadcastVisitorChange(isNew ? 'online' : 'heartbeat', entry);
-  res.json({ active: getStats().onlineCount });
+    // Heartbeats update one row in real time; full stats are serialized only
+    // for a new live session or a newly confirmed permanent visitor.
+    broadcastVisitorChange(isNew ? 'online' : 'heartbeat', entry, isNew || isGloballyNew);
+    res.json({ active: countOnlineUsers() });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/api/visitors/active', (req, res) => {
   const secret = req.headers['x-visitor-secret'];
-  if (secret !== VISITOR_SECRET) return res.status(403).json({ error: 'Forbidden' });
-  res.json({ active: getStats().onlineCount });
+  if (!safeEqual(secret, VISITOR_SECRET)) return res.status(403).json({ error: 'Forbidden' });
+  res.json({ active: countOnlineUsers() });
 });
 
 // ─────────────────────────────────────────────
-// PUBLIC — Stream status & SSE (no auth needed)
+// PUBLIC — Site/stream status & SSE (no auth needed)
 // ─────────────────────────────────────────────
+
+app.get('/api/site/status', async (req, res, next) => {
+  try {
+    await maintenanceInitPromise;
+    res.json({ maintenance: publicMaintenanceState() });
+  } catch (error) {
+    next(error);
+  }
+});
 
 // Public endpoint for the Netlify site to poll stream status
 app.get('/api/stream/status', (req, res) => {
@@ -638,54 +1003,77 @@ app.get('/api/stream/status', (req, res) => {
 });
 
 // Public SSE endpoint — only sends stream_override / stream_update events (no visitor data)
-app.get('/api/events', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders?.();
+app.get('/api/events', async (req, res, next) => {
+  try {
+    await maintenanceInitPromise;
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
 
-  publicSseClients.add(res);
+    publicSseClients.add(res);
 
-  // Send initial stream state
-  const initPayload = JSON.stringify(streamOverride.active ? {
-    active: streamOverride.active,
-    url: streamOverride.url,
-    type: streamOverride.type,
-    startedAt: streamOverride.startedAt
-  } : { active: false, url: null, type: null, startedAt: null });
+    // Send initial stream and site state.
+    const initPayload = JSON.stringify(streamOverride.active ? {
+      active: streamOverride.active,
+      url: streamOverride.url,
+      type: streamOverride.type,
+      startedAt: streamOverride.startedAt
+    } : { active: false, url: null, type: null, startedAt: null });
 
-  res.write(`event: stream_override\ndata: ${initPayload}\n\n`);
-  res.write(`event: stream_update\ndata: ${initPayload}\n\n`);
+    res.write(`event: stream_override\ndata: ${initPayload}\n\n`);
+    res.write(`event: stream_update\ndata: ${initPayload}\n\n`);
+    res.write(`event: maintenance_update\ndata: ${JSON.stringify(publicMaintenanceState())}\n\n`);
 
-  const heartbeat = setInterval(() => {
-    try {
-      res.write(': heartbeat\n\n');
-    } catch (_) {
+    req.on('close', () => {
       publicSseClients.delete(res);
-    }
-  }, 15_000);
-
-  req.on('close', () => {
-    clearInterval(heartbeat);
-    publicSseClients.delete(res);
-  });
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // ─────────────────────────────────────────────
 // ADMIN — STATIC FILES & AUTHENTICATION
 // ─────────────────────────────────────────────
 
-app.use('/admin', express.static(ADMIN_DIR, { index: false, fallthrough: true }));
+app.use('/admin', express.static(ADMIN_DIR, {
+  index: false,
+  fallthrough: true,
+  etag: true,
+  maxAge: process.env.NODE_ENV === 'production' ? '1d' : 0,
+  setHeaders(res, filePath) {
+    if (/\.html?$/i.test(filePath)) res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+    else res.setHeader('Cache-Control', 'private, max-age=3600, must-revalidate');
+  }
+}));
+
+function checkLoginLimit(req, res, next) {
+  const key = getClientIp(req);
+  const now = Date.now();
+  let state = loginAttempts.get(key);
+  if (!state || state.resetAt <= now) state = { count: 0, resetAt: now + 15 * 60 * 1000 };
+  if (state.count >= 10) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil((state.resetAt - now) / 1000))));
+    return res.status(429).json({ success: false, error: 'Too many login attempts. Try again later.' });
+  }
+  req.loginLimitKey = key;
+  req.loginLimitState = state;
+  next();
+}
 
 app.use('/admin/api/login', sessionMiddleware);
-app.post('/admin/api/login', (req, res) => {
+app.post('/admin/api/login', checkLoginLimit, (req, res) => {
   const { username, password } = req.body || {};
   if (safeEqual(username, ADMIN_USER) && safeEqual(password, ADMIN_PASS)) {
+    loginAttempts.delete(req.loginLimitKey);
     req.session.isAdmin = true;
     req.session.loginAt = Date.now();
     return res.json({ success: true });
   }
+  req.loginLimitState.count++;
+  loginAttempts.set(req.loginLimitKey, req.loginLimitState);
   res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
 
@@ -719,6 +1107,44 @@ app.get('/admin/api/stream/status', (req, res) => {
   });
 });
 
+app.get('/admin/api/maintenance', async (req, res, next) => {
+  try {
+    await maintenanceInitPromise;
+    res.json({ maintenance: publicMaintenanceState(), durable: maintenanceStoreReady });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/admin/api/maintenance', async (req, res, next) => {
+  try {
+    await maintenanceInitPromise;
+    const { active, message } = req.body || {};
+    if (typeof active !== 'boolean') {
+      return res.status(400).json({ error: 'The active field must be true or false.' });
+    }
+
+    applyMaintenanceState({
+      active,
+      message,
+      startedAt: active
+        ? (maintenanceMode.active && maintenanceMode.startedAt ? maintenanceMode.startedAt : Date.now())
+        : null,
+      updatedAt: Date.now()
+    });
+
+    const durable = await persistMaintenanceState();
+    const state = publicMaintenanceState();
+    broadcastSSE('maintenance_update', state);
+    broadcastPublicSSE('maintenance_update', state);
+    scheduleStatsBroadcast(0);
+
+    res.json({ success: true, maintenance: state, durable });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post('/admin/api/stream/override', (req, res) => {
   const { url } = req.body || {};
   if (!url || !String(url).trim()) {
@@ -742,7 +1168,7 @@ app.post('/admin/api/stream/override', (req, res) => {
 
   broadcastSSE('stream_override', payload);
   broadcastSSE('stream_update', payload);
-  broadcastSSE('stats', getStats());
+  scheduleStatsBroadcast();
   broadcastPublicSSE('stream_override', payload);
   broadcastPublicSSE('stream_update', payload);
 
@@ -758,7 +1184,7 @@ function stopStreamOverride(message) {
   const payload = { active: false, url: null, type: null, startedAt: null };
   broadcastSSE('stream_override', payload);
   broadcastSSE('stream_update', payload);
-  broadcastSSE('stats', getStats());
+  scheduleStatsBroadcast();
   broadcastPublicSSE('stream_override', payload);
   broadcastPublicSSE('stream_update', payload);
 
@@ -795,16 +1221,7 @@ app.get('/admin/api/events', (req, res) => {
   const payload = `event: init\ndata: ${JSON.stringify(getStats())}\n\n`;
   res.write(payload);
 
-  const heartbeat = setInterval(() => {
-    try {
-      res.write(': heartbeat\n\n');
-    } catch (_) {
-      sseClients.delete(res);
-    }
-  }, 15_000);
-
   req.on('close', () => {
-    clearInterval(heartbeat);
     sseClients.delete(res);
   });
 });
@@ -852,11 +1269,13 @@ function escapeServerHtml(value) {
 // SERVER STARTUP
 // ─────────────────────────────────────────────
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[Server] Running on http://localhost:${PORT}`);
   console.log(`[Main]  Site:  http://localhost:${PORT}/  (${DEV_DIR})`);
   console.log(`[Admin] Panel: http://localhost:${PORT}/admin  (${ADMIN_DIR})`);
   console.log(`[Admin] User:  ${ADMIN_USER}`);
+  console.log(`[Visitors] Unique store: ${UNIQUE_VISITOR_REMOTE_ENABLED ? 'Upstash Redis (durable)' : 'memory (resets on restart)'}`);
+  if (UNIQUE_VISITOR_BASELINE) console.log(`[Visitors] Restored baseline: ${UNIQUE_VISITOR_BASELINE}`);
 
   if (ADMIN_USER === 'admin' && ADMIN_PASS === 'admin') {
     console.warn('[Security] ADMIN_USER/ADMIN_PASS are still the defaults. Set strong values in production.');
@@ -868,3 +1287,25 @@ app.listen(PORT, () => {
     console.warn('[Security] VISITOR_SECRET is still the default. Set a private value in production.');
   }
 });
+
+// Keep reverse-proxy connections reusable without letting stale sockets linger.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+server.requestTimeout = 30_000;
+
+function shutdown(signal) {
+  console.log(`[Server] ${signal} received; shutting down gracefully.`);
+  clearInterval(sseHeartbeatTimer);
+  if (uniqueVisitorSyncTimer) clearInterval(uniqueVisitorSyncTimer);
+  clearTimeout(statsBroadcastTimer);
+  writeSSE(sseClients, 'event: shutdown\ndata: {}\n\n');
+  writeSSE(publicSseClients, 'event: shutdown\ndata: {}\n\n');
+  for (const response of [...sseClients, ...publicSseClients]) response.end();
+  server.close(async () => {
+    await Promise.allSettled([...pendingUniqueWrites.values()]);
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));

@@ -11,6 +11,7 @@ const root = path.resolve(__dirname, '..');
 const port = 34567 + Math.floor(Math.random() * 1000);
 const siteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freef1-site-'));
 fs.writeFileSync(path.join(siteDir, 'index.html'), '<!doctype html><title>FreeF1 Smoke</title><h1>OK</h1>');
+fs.writeFileSync(path.join(siteDir, 'maintenance.html'), '<!doctype html><title>FreeF1 Pit Stop</title><h1>Changing the tires</h1>');
 
 const env = {
   ...process.env,
@@ -67,10 +68,20 @@ async function waitForServer() {
     const health = await request(`http://127.0.0.1:${port}/healthz`);
     assert.equal(health.response.status, 200);
     assert.equal(health.body.ok, true);
+    assert.equal(health.response.headers.get('cache-control'), 'no-store');
+    assert.equal(health.response.headers.get('x-powered-by'), null);
+    assert.equal(health.response.headers.get('x-content-type-options'), 'nosniff');
 
     const home = await request(`http://127.0.0.1:${port}/`);
     assert.equal(home.response.status, 200);
     assert.match(home.text, /FreeF1 Smoke|OK/);
+    assert.match(home.response.headers.get('cache-control') || '', /must-revalidate/);
+
+    const compressedCss = await request(`http://127.0.0.1:${port}/admin/admin.css`, {
+      headers: { 'accept-encoding': 'gzip' }
+    });
+    assert.equal(compressedCss.response.status, 200);
+    assert.equal(compressedCss.response.headers.get('content-encoding'), 'gzip');
 
     const heartbeat = await request(`http://127.0.0.1:${port}/api/visitors/heartbeat`, {
       headers: {
@@ -96,6 +107,46 @@ async function waitForServer() {
     const cookie = login.response.headers.get('set-cookie')?.split(';')[0];
     assert.ok(cookie, 'login should set a session cookie');
 
+    const initialSiteStatus = await request(`http://127.0.0.1:${port}/api/site/status`);
+    assert.equal(initialSiteStatus.response.status, 200);
+    assert.equal(initialSiteStatus.body.maintenance.active, false);
+
+    const enableMaintenance = await request(`http://127.0.0.1:${port}/admin/api/maintenance`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ active: true, message: "We'll be back before the test race." })
+    });
+    assert.equal(enableMaintenance.response.status, 200);
+    assert.equal(enableMaintenance.body.success, true);
+    assert.equal(enableMaintenance.body.maintenance.active, true);
+    assert.equal(enableMaintenance.body.maintenance.message, "We'll be back before the test race.");
+
+    const maintenanceHome = await request(`http://127.0.0.1:${port}/`);
+    assert.equal(maintenanceHome.response.status, 503);
+    assert.match(maintenanceHome.text, /Changing the tires/);
+    assert.equal(maintenanceHome.response.headers.get('cache-control'), 'no-store');
+
+    const disableMaintenance = await request(`http://127.0.0.1:${port}/admin/api/maintenance`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ active: false, message: "We'll be back before the test race." })
+    });
+    assert.equal(disableMaintenance.response.status, 200);
+    assert.equal(disableMaintenance.body.maintenance.active, false);
+
+    const restoredHome = await request(`http://127.0.0.1:${port}/`);
+    assert.equal(restoredHome.response.status, 200);
+    assert.match(restoredHome.text, /FreeF1 Smoke|OK/);
+
+    // Restore the heartbeat page after the direct home-route maintenance checks.
+    await request(`http://127.0.0.1:${port}/api/visitors/heartbeat`, {
+      headers: {
+        'x-visitor-secret': 'smoke-visitor-secret',
+        'x-user-id': 'smoke-user',
+        referer: `http://127.0.0.1:${port}/watch`
+      }
+    });
+
     const visitors = await request(`http://127.0.0.1:${port}/admin/api/visitors`, {
       headers: { cookie }
     });
@@ -103,7 +154,7 @@ async function waitForServer() {
     assert.equal(visitors.body.onlineCount, 1);
     assert.ok(Array.isArray(visitors.body.visitors));
     assert.equal(typeof visitors.body.visitors[0], 'object');
-    assert.equal(visitors.body.visitors[0].page, '/watch');
+    assert.ok(visitors.body.visitors.some(visitor => visitor.page === '/watch'));
 
     const override = await request(`http://127.0.0.1:${port}/admin/api/stream/override`, {
       method: 'POST',
@@ -119,7 +170,7 @@ async function waitForServer() {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        origin: 'https://evil.example'
+        origin: 'https://freef1.netlify.app.evil.example'
       },
       body: JSON.stringify({ username: 'admin', password: 'admin' })
     });

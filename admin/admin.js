@@ -30,6 +30,17 @@ const onlineCountEl  = $('onlineCount');
 const uniqueCountEl  = $('uniqueCount');
 const overrideCountEl = $('overrideCount');
 const overrideSubEl   = $('overrideSub');
+const maintenanceCountEl = $('maintenanceCount');
+const maintenanceSubEl = $('maintenanceSub');
+const maintenanceStatCard = $('maintenanceStatCard');
+const maintenancePanel = $('maintenancePanel');
+const maintenanceBadge = $('maintenanceBadge');
+const maintenanceStatus = $('maintenanceStatus');
+const maintenanceStatusTitle = $('maintenanceStatusTitle');
+const maintenanceStatusText = $('maintenanceStatusText');
+const maintenanceMessage = $('maintenanceMessage');
+const maintenanceToggleBtn = $('maintenanceToggleBtn');
+const maintenanceNote = $('maintenanceNote');
 const serverTimeEl    = $('serverTime');
 const serverDateEl    = $('serverDate');
 const tableBadge      = $('tableBadge');
@@ -46,6 +57,7 @@ const streamPreview     = $('streamPreview');
 const sysUptime         = $('sysUptime');
 const sysVisitorStore   = $('sysVisitorStore');
 const sysOverrideStatus = $('sysOverrideStatus');
+const sysMaintenanceStatus = $('sysMaintenanceStatus');
 const sysNodeEnv        = $('sysNodeEnv');
 const sysSessionActive  = $('sysSessionActive');
 const sseStatus         = $('sseStatus');
@@ -64,6 +76,8 @@ let reconnectDelay = 1500;
 let lastSseMessageAt = 0;
 let currentStats = null;
 let overrideActive = false;
+let maintenanceActive = false;
+let maintenanceStateKnown = false;
 let previewUrl = '';
 
 // ─────────────────────────────────────────────
@@ -192,6 +206,11 @@ function connectSSE() {
     if (data) handleStreamOverrideUpdate(data);
   });
 
+  sse.addEventListener('maintenance_update', e => {
+    const data = readSseEvent(e);
+    if (data) handleMaintenanceUpdate(data);
+  });
+
   sse.addEventListener('error', () => {
     sseConnected = false;
     updateConnectionBar(false);
@@ -222,6 +241,7 @@ function handleStatsUpdate(data) {
   updateStatCards(data);
   updateVisitorTable(data);
   updateStreamStatus(data.override);
+  updateMaintenanceStatus(data.maintenance);
   updateSystemInfo(data);
 }
 
@@ -289,6 +309,54 @@ function updateStreamStatus(override) {
   }
 }
 
+function updateMaintenanceStatus(maintenance) {
+  const state = maintenance || { active: false, message: "We'll be back before the race." };
+  maintenanceActive = Boolean(state.active);
+  maintenanceStateKnown = true;
+
+  if (maintenanceCountEl) {
+    maintenanceCountEl.textContent = maintenanceActive ? 'PIT' : 'LIVE';
+    maintenanceCountEl.classList.toggle('red', maintenanceActive);
+    maintenanceCountEl.classList.toggle('green', !maintenanceActive);
+  }
+  if (maintenanceSubEl) {
+    maintenanceSubEl.textContent = maintenanceActive
+      ? `Active ${formatTimeAgo(state.startedAt)}`
+      : 'Public site is available';
+  }
+  maintenanceStatCard?.classList.toggle('maintenance-active', maintenanceActive);
+  maintenancePanel?.classList.toggle('mode-active', maintenanceActive);
+
+  if (maintenanceBadge) {
+    maintenanceBadge.textContent = maintenanceActive ? 'Maintenance' : 'Live';
+    maintenanceBadge.className = `panel-badge ${maintenanceActive ? 'live' : 'normal'}`;
+  }
+  if (maintenanceStatus) {
+    maintenanceStatus.classList.toggle('is-live', !maintenanceActive);
+    maintenanceStatus.classList.toggle('is-active', maintenanceActive);
+  }
+  if (maintenanceStatusTitle) maintenanceStatusTitle.textContent = maintenanceActive ? 'Pit Lane Closed' : 'Public Site Live';
+  if (maintenanceStatusText) {
+    maintenanceStatusText.textContent = maintenanceActive
+      ? 'Visitors are seeing the dedicated pit-stop maintenance page.'
+      : 'Visitors can access the full APEX experience.';
+  }
+  if (maintenanceMessage && document.activeElement !== maintenanceMessage) {
+    maintenanceMessage.value = state.message || "We'll be back before the race.";
+  }
+  if (maintenanceToggleBtn) {
+    maintenanceToggleBtn.disabled = false;
+    maintenanceToggleBtn.classList.toggle('is-active', maintenanceActive);
+    maintenanceToggleBtn.setAttribute('aria-pressed', String(maintenanceActive));
+    maintenanceToggleBtn.textContent = maintenanceActive ? 'Return Website to Live' : 'Enable Maintenance Mode';
+  }
+  if (maintenanceNote) {
+    maintenanceNote.textContent = maintenanceActive
+      ? 'The pit-stop page is live. Returning to Live releases every connected visitor automatically.'
+      : 'Activation is instant. Open visitors will be sent to the pit-stop page automatically.';
+  }
+}
+
 function updateStreamButtons(active) {
   if (playOverrideBtn)  playOverrideBtn.disabled = active;
   if (stopOverrideBtn)  stopOverrideBtn.disabled = !active;
@@ -305,6 +373,11 @@ function updateSystemInfo(data) {
   if (sysOverrideStatus) {
     sysOverrideStatus.textContent = data?.override?.active ? 'OVERRIDE' : 'NORMAL';
     sysOverrideStatus.style.color = data?.override?.active ? '#ff6b62' : 'var(--green)';
+  }
+  if (sysMaintenanceStatus) {
+    const active = Boolean(data?.maintenance?.active);
+    sysMaintenanceStatus.textContent = active ? 'MAINTENANCE' : 'LIVE';
+    sysMaintenanceStatus.style.color = active ? '#ff6b62' : 'var(--green)';
   }
   if (sysSessionActive) sysSessionActive.textContent = isAdmin ? 'Yes' : 'No';
   if (sysNodeEnv) sysNodeEnv.textContent = String(data?.server?.nodeEnv || 'production').toUpperCase();
@@ -410,6 +483,60 @@ function handleStreamOverrideUpdate(data) {
   handleStreamStatusUpdate(data);
   if (changed) showToast(data.active ? 'Stream override activated.' : 'Stream override deactivated — normal feed restored.', data.active ? 'warning' : 'success');
 }
+
+function handleMaintenanceUpdate(data) {
+  const wasKnown = maintenanceStateKnown;
+  const changed = wasKnown && Boolean(data?.active) !== maintenanceActive;
+  if (currentStats) currentStats.maintenance = data;
+  updateMaintenanceStatus(data);
+  if (currentStats) updateSystemInfo(currentStats);
+  if (changed) {
+    showToast(
+      data.active ? 'Maintenance mode enabled — the public site is now in the pits.' : 'Public website released — APEX is live again.',
+      data.active ? 'warning' : 'success'
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// WEBSITE MODE CONTROL
+// ─────────────────────────────────────────────
+async function toggleMaintenanceMode() {
+  if (!maintenanceStateKnown || !maintenanceToggleBtn) return;
+  const nextActive = !maintenanceActive;
+  const message = maintenanceMessage?.value.trim() || "We'll be back before the race.";
+
+  if (nextActive && !window.confirm('Enable maintenance mode now? Every public visitor will be moved to the pit-stop page.')) return;
+
+  maintenanceToggleBtn.disabled = true;
+  maintenanceToggleBtn.textContent = nextActive ? 'Sending Site to the Pits…' : 'Releasing Website…';
+
+  try {
+    const response = await fetch(`${API_BASE}/maintenance`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active: nextActive, message })
+    });
+    const data = await response.json();
+    if (!response.ok || !data.success) throw new Error(data.error || 'Maintenance update failed.');
+
+    if (currentStats) currentStats.maintenance = data.maintenance;
+    updateMaintenanceStatus(data.maintenance);
+    if (!data.durable) {
+      showToast('Mode changed, but permanent storage is unavailable. Configure Upstash before restarting Render.', 'warning');
+    } else {
+      showToast(nextActive ? 'Maintenance mode is live.' : 'The public website is live again.', nextActive ? 'warning' : 'success');
+    }
+  } catch (error) {
+    showToast(error.message || 'Network error changing website mode.', 'error');
+    updateMaintenanceStatus({
+      active: maintenanceActive,
+      message: maintenanceMessage?.value || "We'll be back before the race."
+    });
+  }
+}
+
+maintenanceToggleBtn?.addEventListener('click', toggleMaintenanceMode);
 
 // ─────────────────────────────────────────────
 // STREAM CONTROLS
