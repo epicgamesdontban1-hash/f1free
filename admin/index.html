@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" onload="this.onload=null;this.rel='stylesheet'">
   <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap"></noscript>
-  <link rel="stylesheet" href="/admin/admin.css?v=20260823-maintenance2">
+  <link rel="stylesheet" href="/admin/admin.css?v=20260825-news1">
 </head>
 <body>
 
@@ -149,6 +149,42 @@
             </div>
           </div>
 
+          <!-- News Control Panel -->
+          <div class="panel news-control" id="newsControlPanel">
+            <div class="panel-head">
+              <div class="panel-title">News Updates</div>
+              <div class="panel-badge normal" id="newsBadge">0 Published</div>
+            </div>
+            <div class="news-admin-panel">
+              <form id="newsForm" class="news-form" autocomplete="off">
+                <input type="hidden" id="newsId" value="">
+                <div class="form-group">
+                  <label for="newsTitle">Headline</label>
+                  <input class="url-input" type="text" id="newsTitle" maxlength="100" placeholder="e.g. Qualifying starts in one hour" required>
+                </div>
+                <div class="news-form-row">
+                  <div class="form-group">
+                    <label for="newsTag">Label</label>
+                    <input class="url-input" type="text" id="newsTag" maxlength="32" value="Race Control" placeholder="Race Control">
+                  </div>
+                  <label class="news-publish"><input type="checkbox" id="newsPublished" checked> <span>Publish update</span></label>
+                </div>
+                <div class="form-group" style="margin-bottom:0">
+                  <label for="newsBody">Update</label>
+                  <textarea class="url-input" id="newsBody" maxlength="600" rows="4" placeholder="Write a short update for the public site…" required></textarea>
+                </div>
+                <div class="url-hint">Plain text · 100 characters for the headline · 600 for the update</div>
+                <div class="btn-row news-form-actions">
+                  <button class="btn-sm btn-red" id="newsSaveBtn" type="submit">Publish Update</button>
+                  <button class="btn-sm btn-ghost" id="newsCancelBtn" type="button" hidden>Cancel Edit</button>
+                </div>
+              </form>
+              <div class="admin-news-list" id="adminNewsList">
+                <div class="empty-state">Loading news updates…</div>
+              </div>
+            </div>
+          </div>
+
           <!-- Stream Control Panel -->
           <div class="panel">
             <div class="panel-head">
@@ -250,6 +286,6 @@
   <!-- Toast Container -->
   <div class="toast-container" id="toastContainer"></div>
 
-  <script src="/admin/admin.js?v=20260823-maintenance2" defer></script>
+  <script src="/admin/admin.js?v=20260825-news1" defer></script>
 </body>
 </html>

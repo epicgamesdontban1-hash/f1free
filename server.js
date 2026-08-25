@@ -28,6 +28,8 @@ const ALLOWED_ORIGINS = parseOrigins(process.env.ALLOWED_ORIGIN || 'https://free
 const UNIQUE_VISITOR_BASELINE = Math.max(0, Number.parseInt(process.env.UNIQUE_VISITOR_BASELINE || '0', 10) || 0);
 const UNIQUE_VISITOR_REDIS_KEY = process.env.UNIQUE_VISITOR_REDIS_KEY || 'freef1:unique-visitors:v1';
 const MAINTENANCE_REDIS_KEY = process.env.MAINTENANCE_REDIS_KEY || 'freef1:maintenance:v1';
+const NEWS_REDIS_KEY = process.env.NEWS_REDIS_KEY || 'freef1:news:v1';
+const NEWS_MAX_ITEMS = Math.max(1, Math.min(100, Number.parseInt(process.env.NEWS_MAX_ITEMS || '50', 10) || 50));
 const UNIQUE_VISITOR_HASH_SECRET = process.env.UNIQUE_VISITOR_HASH_SECRET || ADMIN_SECRET;
 const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
 const UPSTASH_REDIS_REST_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || '');
@@ -194,6 +196,12 @@ const maintenanceMode = {
 };
 let maintenanceStoreReady = !UNIQUE_VISITOR_REMOTE_ENABLED;
 let maintenanceInitPromise = Promise.resolve(false);
+
+// Small, admin-managed public news feed. The array is the fast local snapshot;
+// Upstash keeps updates available after a Render restart when configured.
+const newsItems = [];
+let newsStoreReady = !UNIQUE_VISITOR_REMOTE_ENABLED;
+let newsInitPromise = Promise.resolve(false);
 
 // SSE clients for admin dashboard
 const sseClients = new Set();
@@ -383,6 +391,12 @@ function broadcastSSE(event, data) {
 function broadcastPublicSSE(event, data) {
   if (!publicSseClients.size) return;
   writeSSE(publicSseClients, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function broadcastNewsUpdate() {
+  const payload = { news: getPublicNewsItems() };
+  broadcastSSE('news_update', payload);
+  broadcastPublicSSE('news_update', payload);
 }
 
 let statsBroadcastTimer = null;
@@ -627,6 +641,146 @@ async function persistMaintenanceState() {
   }
 }
 
+function cleanNewsText(value, maxLength, preserveLineBreaks = false) {
+  let text = String(value == null ? '' : value)
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u001F\u007F]/g, character => character === '\n' ? '\n' : ' ');
+  if (preserveLineBreaks) {
+    text = text.split('\n').map(line => line.replace(/[ \t]+/g, ' ').trim()).join('\n');
+  } else {
+    text = text.replace(/\s+/g, ' ');
+  }
+  return text.trim().slice(0, maxLength).trim();
+}
+
+function createNewsId() {
+  return `news_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function normalizeNewsRecord(raw = {}, existing = null) {
+  const now = Date.now();
+  const source = raw || {};
+  const id = existing?.id || cleanNewsText(source.id, 80).replace(/[^A-Za-z0-9_-]/g, '') || createNewsId();
+  const createdAt = Number(existing?.createdAt || source.createdAt);
+  const updatedAt = Number(source.updatedAt || existing?.updatedAt);
+  return {
+    id,
+    title: cleanNewsText(source.title, 100),
+    body: cleanNewsText(source.body, 600, true),
+    tag: cleanNewsText(source.tag, 32) || 'Race Control',
+    published: source.published !== false,
+    createdAt: Number.isFinite(createdAt) && createdAt > 0 ? createdAt : now,
+    updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : now
+  };
+}
+
+function newsForResponse(item) {
+  return {
+    id: item.id,
+    title: item.title,
+    body: item.body,
+    tag: item.tag,
+    published: Boolean(item.published),
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt
+  };
+}
+
+function sortNewsItems() {
+  newsItems.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+}
+
+function getPublicNewsItems() {
+  return newsItems
+    .filter(item => item.published && item.title && item.body)
+    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    .map(newsForResponse);
+}
+
+function getAdminNewsItems() {
+  return newsItems
+    .slice()
+    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    .map(newsForResponse);
+}
+
+function newsInputError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+}
+
+function createNewsRecord(input = {}) {
+  const item = normalizeNewsRecord(input);
+  if (!item.title) throw newsInputError('A news title is required.');
+  if (!item.body) throw newsInputError('A news update is required.');
+  newsItems.unshift(item);
+  sortNewsItems();
+  newsItems.splice(NEWS_MAX_ITEMS);
+  return item;
+}
+
+function updateNewsRecord(id, input = {}) {
+  const index = newsItems.findIndex(item => item.id === id);
+  if (index < 0) return null;
+  const item = normalizeNewsRecord({ ...newsItems[index], ...input, updatedAt: Date.now() }, newsItems[index]);
+  if (!item.title) throw newsInputError('A news title is required.');
+  if (!item.body) throw newsInputError('A news update is required.');
+  newsItems[index] = item;
+  sortNewsItems();
+  return item;
+}
+
+function deleteNewsRecord(id) {
+  const index = newsItems.findIndex(item => item.id === id);
+  if (index < 0) return false;
+  newsItems.splice(index, 1);
+  return true;
+}
+
+async function syncNewsStore() {
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) {
+    newsStoreReady = true;
+    return false;
+  }
+
+  try {
+    const payload = await upstashRequest(['GET', NEWS_REDIS_KEY]);
+    if (payload?.result) {
+      const stored = JSON.parse(payload.result);
+      const restored = Array.isArray(stored)
+        ? stored.map(item => normalizeNewsRecord(item)).filter(item => item.title && item.body).slice(0, NEWS_MAX_ITEMS)
+        : [];
+      newsItems.splice(0, newsItems.length, ...restored);
+      sortNewsItems();
+    }
+    newsStoreReady = true;
+    return true;
+  } catch (error) {
+    warnUniqueStore(error);
+    newsStoreReady = false;
+    return false;
+  }
+}
+
+async function persistNewsStore() {
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) return false;
+  try {
+    const payload = await upstashRequest(['SET', NEWS_REDIS_KEY, JSON.stringify(newsItems)]);
+    if (payload?.result !== 'OK') throw new Error('Upstash did not confirm the news update');
+    newsStoreReady = true;
+    return true;
+  } catch (error) {
+    warnUniqueStore(error);
+    newsStoreReady = false;
+    return false;
+  }
+}
+
+function newsStoreIsDurable() {
+  return UNIQUE_VISITOR_REMOTE_ENABLED && newsStoreReady;
+}
+
 // Keep the local snapshot in sync if the service is ever scaled beyond one
 // process. This is a single lightweight request every five minutes.
 const uniqueVisitorSyncTimer = UNIQUE_VISITOR_REMOTE_ENABLED
@@ -636,6 +790,7 @@ uniqueVisitorSyncTimer?.unref?.();
 if (UNIQUE_VISITOR_REMOTE_ENABLED) {
   syncUniqueVisitorCount();
   maintenanceInitPromise = syncMaintenanceState();
+  newsInitPromise = syncNewsStore();
 } else if (UPSTASH_REDIS_REST_URL || UPSTASH_REDIS_REST_TOKEN) {
   console.warn('[Visitors] Both UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are required; unique totals and maintenance mode are in-memory only.');
 } else {
@@ -992,6 +1147,16 @@ app.get('/api/site/status', async (req, res, next) => {
   }
 });
 
+// Public news feed — unpublished drafts never leave the server.
+app.get('/api/news', async (req, res, next) => {
+  try {
+    await newsInitPromise;
+    res.json({ news: getPublicNewsItems() });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Public endpoint for the Netlify site to poll stream status
 app.get('/api/stream/status', (req, res) => {
   res.json({
@@ -1002,10 +1167,10 @@ app.get('/api/stream/status', (req, res) => {
   });
 });
 
-// Public SSE endpoint — only sends stream_override / stream_update events (no visitor data)
+// Public SSE endpoint — sends public stream, maintenance and news updates (no visitor data)
 app.get('/api/events', async (req, res, next) => {
   try {
-    await maintenanceInitPromise;
+    await Promise.all([maintenanceInitPromise, newsInitPromise]);
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -1025,6 +1190,7 @@ app.get('/api/events', async (req, res, next) => {
     res.write(`event: stream_override\ndata: ${initPayload}\n\n`);
     res.write(`event: stream_update\ndata: ${initPayload}\n\n`);
     res.write(`event: maintenance_update\ndata: ${JSON.stringify(publicMaintenanceState())}\n\n`);
+    res.write(`event: news_update\ndata: ${JSON.stringify({ news: getPublicNewsItems() })}\n\n`);
 
     req.on('close', () => {
       publicSseClients.delete(res);
@@ -1147,6 +1313,54 @@ app.post('/admin/api/maintenance', async (req, res, next) => {
   }
 });
 
+app.get('/admin/api/news', async (req, res, next) => {
+  try {
+    await newsInitPromise;
+    res.json({ news: getAdminNewsItems(), durable: newsStoreIsDurable() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/admin/api/news', async (req, res, next) => {
+  try {
+    await newsInitPromise;
+    const item = createNewsRecord(req.body || {});
+    const durable = await persistNewsStore();
+    broadcastNewsUpdate();
+    res.status(201).json({ success: true, news: newsForResponse(item), durable });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.patch('/admin/api/news/:id', async (req, res, next) => {
+  try {
+    await newsInitPromise;
+    const item = updateNewsRecord(req.params.id, req.body || {});
+    if (!item) return res.status(404).json({ error: 'News item not found.' });
+    const durable = await persistNewsStore();
+    broadcastNewsUpdate();
+    res.json({ success: true, news: newsForResponse(item), durable });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.delete('/admin/api/news/:id', async (req, res, next) => {
+  try {
+    await newsInitPromise;
+    if (!deleteNewsRecord(req.params.id)) return res.status(404).json({ error: 'News item not found.' });
+    const durable = await persistNewsStore();
+    broadcastNewsUpdate();
+    res.json({ success: true, durable });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post('/admin/api/stream/override', (req, res) => {
   const { url } = req.body || {};
   if (!url || !String(url).trim()) {
@@ -1222,6 +1436,7 @@ app.get('/admin/api/events', (req, res) => {
   // Send initial snapshot
   const payload = `event: init\ndata: ${JSON.stringify(getStats())}\n\n`;
   res.write(payload);
+  res.write(`event: news_update\ndata: ${JSON.stringify({ news: getAdminNewsItems(), durable: newsStoreIsDurable() })}\n\n`);
 
   req.on('close', () => {
     sseClients.delete(res);

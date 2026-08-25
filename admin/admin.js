@@ -64,6 +64,16 @@ const sseStatus         = $('sseStatus');
 const streamBadge       = $('streamBadge');
 const toastContainer    = $('toastContainer');
 const connBarFill       = $('connBarFill');
+const newsForm          = $('newsForm');
+const newsIdInput       = $('newsId');
+const newsTitleInput    = $('newsTitle');
+const newsTagInput      = $('newsTag');
+const newsBodyInput     = $('newsBody');
+const newsPublishedInput = $('newsPublished');
+const newsSaveBtn       = $('newsSaveBtn');
+const newsCancelBtn     = $('newsCancelBtn');
+const newsBadge         = $('newsBadge');
+const adminNewsList     = $('adminNewsList');
 
 // ─────────────────────────────────────────────
 // STATE
@@ -79,6 +89,7 @@ let overrideActive = false;
 let maintenanceActive = false;
 let maintenanceStateKnown = false;
 let previewUrl = '';
+let newsItems = [];
 
 // ─────────────────────────────────────────────
 // AUTH
@@ -111,6 +122,7 @@ function showDashboard() {
   connectSSE();
   pollStats();
   loadMaintenanceStatus();
+  loadNews();
 }
 
 async function handleLogin(e) {
@@ -210,6 +222,11 @@ function connectSSE() {
   sse.addEventListener('maintenance_update', e => {
     const data = readSseEvent(e);
     if (data) handleMaintenanceUpdate(data);
+  });
+
+  sse.addEventListener('news_update', e => {
+    const data = readSseEvent(e);
+    if (data) handleNewsUpdate(data);
   });
 
   sse.addEventListener('error', () => {
@@ -383,6 +400,190 @@ function updateSystemInfo(data) {
   if (sysSessionActive) sysSessionActive.textContent = isAdmin ? 'Yes' : 'No';
   if (sysNodeEnv) sysNodeEnv.textContent = String(data?.server?.nodeEnv || 'production').toUpperCase();
 }
+
+// ─────────────────────────────────────────────
+// NEWS MANAGEMENT
+// ─────────────────────────────────────────────
+function newsFromPayload(data) {
+  if (Array.isArray(data)) return data;
+  return Array.isArray(data?.news) ? data.news : [];
+}
+
+function formatNewsDate(timestamp) {
+  const date = new Date(Number(timestamp));
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+function handleNewsUpdate(data) {
+  newsItems = newsFromPayload(data);
+  renderNewsAdmin();
+}
+
+function renderNewsAdmin() {
+  if (!adminNewsList) return;
+  const publishedCount = newsItems.filter(item => item.published).length;
+  if (newsBadge) {
+    newsBadge.textContent = `${publishedCount} Published`;
+    newsBadge.className = `panel-badge ${publishedCount ? 'normal' : 'live'}`;
+  }
+
+  if (!newsItems.length) {
+    adminNewsList.innerHTML = '<div class="empty-state">No news updates yet.</div>';
+    return;
+  }
+
+  adminNewsList.innerHTML = newsItems.map(item => `
+    <article class="admin-news-item">
+      <div class="admin-news-item-head">
+        <span class="admin-news-tag">${escapeHtml(item.tag || 'Race Control')}</span>
+        <span class="admin-news-state ${item.published ? '' : 'draft'}">${item.published ? 'Published' : 'Draft'}</span>
+      </div>
+      <h3>${escapeHtml(item.title)}</h3>
+      <p>${escapeHtml(item.body)}</p>
+      <div class="admin-news-item-foot">
+        <span class="admin-news-date">${escapeHtml(formatNewsDate(item.createdAt))}</span>
+        <div class="admin-news-actions">
+          <button class="news-action" type="button" data-news-action="toggle" data-news-id="${escapeHtml(item.id)}">${item.published ? 'Unpublish' : 'Publish'}</button>
+          <button class="news-action" type="button" data-news-action="edit" data-news-id="${escapeHtml(item.id)}">Edit</button>
+          <button class="news-action delete" type="button" data-news-action="delete" data-news-id="${escapeHtml(item.id)}">Delete</button>
+        </div>
+      </div>
+    </article>`).join('');
+}
+
+async function loadNews(notifyOnError = false) {
+  if (!adminNewsList) return false;
+  try {
+    const response = await fetch(`${API_BASE}/news`, { cache: 'no-store', headers: { Accept: 'application/json' } });
+    if (response.status === 401) {
+      showLogin();
+      return false;
+    }
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'News endpoint is unavailable.');
+    handleNewsUpdate(data);
+    return true;
+  } catch (error) {
+    adminNewsList.innerHTML = '<div class="empty-state">Could not load news updates.</div>';
+    if (notifyOnError) showToast(error.message || 'Could not load news updates.', 'error');
+    return false;
+  }
+}
+
+function resetNewsForm() {
+  if (!newsForm) return;
+  newsIdInput.value = '';
+  newsTitleInput.value = '';
+  newsTagInput.value = 'Race Control';
+  newsBodyInput.value = '';
+  newsPublishedInput.checked = true;
+  newsSaveBtn.textContent = 'Publish Update';
+  newsCancelBtn.hidden = true;
+}
+
+function editNews(item) {
+  if (!item || !newsForm) return;
+  newsIdInput.value = item.id || '';
+  newsTitleInput.value = item.title || '';
+  newsTagInput.value = item.tag || 'Race Control';
+  newsBodyInput.value = item.body || '';
+  newsPublishedInput.checked = item.published !== false;
+  newsSaveBtn.textContent = 'Save Changes';
+  newsCancelBtn.hidden = false;
+  newsTitleInput.focus();
+}
+
+async function saveNews(event) {
+  event.preventDefault();
+  const title = newsTitleInput.value.trim();
+  const body = newsBodyInput.value.trim();
+  if (!title || !body) {
+    showToast('Add a headline and update first.', 'error');
+    return;
+  }
+
+  const id = newsIdInput.value.trim();
+  const method = id ? 'PATCH' : 'POST';
+  const endpoint = id ? `${API_BASE}/news/${encodeURIComponent(id)}` : `${API_BASE}/news`;
+  newsSaveBtn.disabled = true;
+  newsCancelBtn.disabled = true;
+  newsSaveBtn.textContent = id ? 'Saving…' : 'Publishing…';
+
+  try {
+    const response = await fetch(endpoint, {
+      method,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ title, body, tag: newsTagInput.value.trim(), published: newsPublishedInput.checked })
+    });
+    if (response.status === 401) {
+      showLogin();
+      return;
+    }
+    const data = await response.json();
+    if (!response.ok || !data.success) throw new Error(data.error || 'News update failed.');
+    showToast(id ? 'News update saved.' : 'News update published.', 'success');
+    if (!data.durable) showToast('Saved in memory only. Configure Upstash to keep news after a server restart.', 'warning');
+    resetNewsForm();
+    await loadNews();
+  } catch (error) {
+    showToast(error.message || 'Network error saving news.', 'error');
+    newsSaveBtn.textContent = id ? 'Save Changes' : 'Publish Update';
+  } finally {
+    newsSaveBtn.disabled = false;
+    newsCancelBtn.disabled = false;
+  }
+}
+
+async function toggleNewsPublished(item) {
+  if (!item) return;
+  try {
+    const response = await fetch(`${API_BASE}/news/${encodeURIComponent(item.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ published: !item.published })
+    });
+    if (response.status === 401) {
+      showLogin();
+      return;
+    }
+    const data = await response.json();
+    if (!response.ok || !data.success) throw new Error(data.error || 'Could not change publication status.');
+    showToast(item.published ? 'News update unpublished.' : 'News update published.', item.published ? 'info' : 'success');
+    await loadNews();
+  } catch (error) {
+    showToast(error.message || 'Network error changing publication status.', 'error');
+  }
+}
+
+async function deleteNews(item) {
+  if (!item || !window.confirm(`Delete “${item.title}”?`)) return;
+  try {
+    const response = await fetch(`${API_BASE}/news/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+    if (response.status === 401) {
+      showLogin();
+      return;
+    }
+    const data = await response.json();
+    if (!response.ok || !data.success) throw new Error(data.error || 'Could not delete news update.');
+    if (newsIdInput.value === item.id) resetNewsForm();
+    showToast('News update deleted.', 'success');
+    await loadNews();
+  } catch (error) {
+    showToast(error.message || 'Network error deleting news.', 'error');
+  }
+}
+
+newsForm?.addEventListener('submit', saveNews);
+newsCancelBtn?.addEventListener('click', resetNewsForm);
+adminNewsList?.addEventListener('click', event => {
+  const button = event.target.closest('[data-news-action]');
+  if (!button) return;
+  const item = newsItems.find(entry => entry.id === button.dataset.newsId);
+  if (button.dataset.newsAction === 'edit') editNews(item);
+  if (button.dataset.newsAction === 'toggle') toggleNewsPublished(item);
+  if (button.dataset.newsAction === 'delete') deleteNews(item);
+});
 
 // ─────────────────────────────────────────────
 // VISITOR TABLE
