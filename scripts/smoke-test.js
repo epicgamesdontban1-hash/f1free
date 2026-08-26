@@ -10,6 +10,7 @@ const path = require('path');
 const root = path.resolve(__dirname, '..');
 const port = 34567 + Math.floor(Math.random() * 1000);
 const siteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freef1-site-'));
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freef1-data-'));
 fs.writeFileSync(path.join(siteDir, 'index.html'), '<!doctype html><title>FreeF1 Smoke</title><h1>OK</h1>');
 fs.writeFileSync(path.join(siteDir, 'maintenance.html'), '<!doctype html><title>FreeF1 Pit Stop</title><h1>Changing the tires</h1>');
 
@@ -23,6 +24,9 @@ const env = {
   ADMIN_SECRET: 'smoke-test-secret',
   VISITOR_SECRET: 'smoke-visitor-secret',
   GEO_API: 'http://127.0.0.1:9',
+  DATA_DIR: dataDir,
+  UPSTASH_REDIS_REST_URL: '',
+  UPSTASH_REDIS_REST_TOKEN: '',
   NODE_ENV: 'test'
 };
 
@@ -83,9 +87,15 @@ async function waitForServer() {
     assert.equal(compressedCss.response.status, 200);
     assert.equal(compressedCss.response.headers.get('content-encoding'), 'gzip');
 
+    const visitorToken = await request(`http://127.0.0.1:${port}/api/visitors/token`, {
+      headers: { 'x-user-id': 'smoke-user' }
+    });
+    assert.equal(visitorToken.response.status, 200);
+    assert.ok(visitorToken.body.token);
+
     const heartbeat = await request(`http://127.0.0.1:${port}/api/visitors/heartbeat`, {
       headers: {
-        'x-visitor-secret': 'smoke-visitor-secret',
+        'x-visitor-token': visitorToken.body.token,
         'x-user-id': 'smoke-user',
         referer: `http://127.0.0.1:${port}/watch`
       }
@@ -104,12 +114,45 @@ async function waitForServer() {
     assert.equal(login.response.status, 200);
     assert.equal(login.body.success, true);
 
-    const cookie = login.response.headers.get('set-cookie')?.split(';')[0];
+    const setCookies = login.response.headers.getSetCookie?.() || [];
+    const cookie = setCookies.length
+      ? setCookies.map(value => value.split(';')[0]).join('; ')
+      : login.response.headers.get('set-cookie')?.split(/,(?=\s*freef1\.sid)/).map(value => value.split(';')[0]).join('; ');
     assert.ok(cookie, 'login should set a session cookie');
 
     const initialSiteStatus = await request(`http://127.0.0.1:${port}/api/site/status`);
     assert.equal(initialSiteStatus.response.status, 200);
     assert.equal(initialSiteStatus.body.maintenance.active, false);
+
+    const initialNews = await request(`http://127.0.0.1:${port}/api/news`);
+    assert.equal(initialNews.response.status, 200);
+    assert.deepEqual(initialNews.body.news, []);
+
+    const createdNews = await request(`http://127.0.0.1:${port}/admin/api/news`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        title: 'Smoke test headline',
+        body: 'The news control is working.',
+        tag: 'Testing',
+        published: true
+      })
+    });
+    assert.equal(createdNews.response.status, 201);
+    assert.equal(createdNews.body.success, true);
+    assert.equal(createdNews.body.news.title, 'Smoke test headline');
+
+    const publicNews = await request(`http://127.0.0.1:${port}/api/news`);
+    assert.equal(publicNews.response.status, 200);
+    assert.equal(publicNews.body.news.length, 1);
+    assert.equal(publicNews.body.news[0].body, 'The news control is working.');
+
+    const deletedNews = await request(`http://127.0.0.1:${port}/admin/api/news/${encodeURIComponent(createdNews.body.news.id)}`, {
+      method: 'DELETE',
+      headers: { cookie }
+    });
+    assert.equal(deletedNews.response.status, 200);
+    assert.equal(deletedNews.body.success, true);
 
     const enableMaintenance = await request(`http://127.0.0.1:${port}/admin/api/maintenance`, {
       method: 'POST',
@@ -141,7 +184,7 @@ async function waitForServer() {
     // Restore the heartbeat page after the direct home-route maintenance checks.
     await request(`http://127.0.0.1:${port}/api/visitors/heartbeat`, {
       headers: {
-        'x-visitor-secret': 'smoke-visitor-secret',
+        'x-visitor-token': visitorToken.body.token,
         'x-user-id': 'smoke-user',
         referer: `http://127.0.0.1:${port}/watch`
       }
@@ -181,6 +224,7 @@ async function waitForServer() {
     child.kill('SIGTERM');
     await sleep(100);
     fs.rmSync(siteDir, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
 })().catch(err => {
   child.kill('SIGTERM');

@@ -3,8 +3,7 @@
 const crypto = require('crypto');
 const compression = require('compression');
 const express = require('express');
-const session = require('express-session');
-const MemoryStore = require('memorystore')(session);
+const cookieSession = require('cookie-session');
 const fs = require('fs');
 const path = require('path');
 
@@ -30,10 +29,26 @@ const UNIQUE_VISITOR_REDIS_KEY = process.env.UNIQUE_VISITOR_REDIS_KEY || 'freef1
 const MAINTENANCE_REDIS_KEY = process.env.MAINTENANCE_REDIS_KEY || 'freef1:maintenance:v1';
 const NEWS_REDIS_KEY = process.env.NEWS_REDIS_KEY || 'freef1:news:v1';
 const NEWS_MAX_ITEMS = Math.max(1, Math.min(100, Number.parseInt(process.env.NEWS_MAX_ITEMS || '50', 10) || 50));
-const UNIQUE_VISITOR_HASH_SECRET = process.env.UNIQUE_VISITOR_HASH_SECRET || ADMIN_SECRET;
+// Keep visitor hashes independent from the admin cookie key so rotating
+// ADMIN_SECRET does not reset the unique-visitor identity space.
+const UNIQUE_VISITOR_HASH_SECRET = process.env.UNIQUE_VISITOR_HASH_SECRET || VISITOR_SECRET;
 const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
 const UPSTASH_REDIS_REST_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || '');
 const UNIQUE_VISITOR_REMOTE_ENABLED = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const NEWS_FILE = path.join(DATA_DIR, 'news.json');
+const MAINTENANCE_FILE = path.join(DATA_DIR, 'maintenance.json');
+const UNIQUE_VISITORS_FILE = path.join(DATA_DIR, 'unique-visitors.json');
+const PRODUCTION_MODE = process.env.NODE_ENV === 'production' || process.env.REQUIRE_PRODUCTION_SECRETS === '1';
+const insecureProductionConfig = [
+  !process.env.ADMIN_USER ? 'ADMIN_USER' : null,
+  !process.env.ADMIN_PASS || process.env.ADMIN_PASS === 'admin' ? 'ADMIN_PASS' : null,
+  !process.env.ADMIN_SECRET || process.env.ADMIN_SECRET === 'freef1-admin-secret-change-me' ? 'ADMIN_SECRET' : null,
+  !process.env.VISITOR_SECRET || process.env.VISITOR_SECRET === 'doggomc' ? 'VISITOR_SECRET' : null
+].filter(Boolean);
+if (PRODUCTION_MODE && insecureProductionConfig.length) {
+  throw new Error(`Refusing to start with insecure production configuration: ${insecureProductionConfig.join(', ')}.`);
+}
 
 // Site root — set DEV_DIR to the folder containing your index.html
 // Render example: DEV_DIR=/opt/render/project/Development-FreeF1
@@ -133,6 +148,10 @@ function isLocalOrigin(origin) {
   }
 }
 
+function isPreviewOrigin(origin) {
+  try { return new URL(origin).hostname.endsWith('.e2b.app'); } catch (_) { return false; }
+}
+
 function isSameOriginRequest(req, origin) {
   if (!origin || !req.headers.host) return false;
   const host = req.headers.host;
@@ -147,7 +166,8 @@ function isAllowedOrigin(req, origin) {
   return (
     ALLOWED_ORIGINS.includes(origin) ||
     isSameOriginRequest(req, origin) ||
-    isLocalOrigin(origin)
+    isLocalOrigin(origin) ||
+    isPreviewOrigin(origin)
   );
 }
 
@@ -169,7 +189,7 @@ const visitorKeysSeen = new Set();
 const persistedVisitorHashes = new Set();
 const pendingUniqueWrites = new Map();
 let persistentUniqueCount = 0;
-let uniqueVisitorStoreReady = !UNIQUE_VISITOR_REMOTE_ENABLED;
+let uniqueVisitorStoreReady = false;
 let lastUniqueStoreWarningAt = 0;
 // O(1) IP lookups avoid scanning every active visitor on each heartbeat.
 const visitorKeyByIp = new Map();
@@ -177,6 +197,8 @@ const visitorKeyByIp = new Map();
 const geoCache = new Map();
 const pendingGeoLookups = new Map();
 const loginAttempts = new Map();
+const visitorRateLimits = new Map();
+let fileStoreReady = false;
 const GEO_CACHE_TTL = Number(process.env.GEO_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 
 // Stream override state
@@ -194,13 +216,13 @@ const maintenanceMode = {
   startedAt: null,
   updatedAt: null
 };
-let maintenanceStoreReady = !UNIQUE_VISITOR_REMOTE_ENABLED;
+let maintenanceStoreReady = false;
 let maintenanceInitPromise = Promise.resolve(false);
 
 // Small, admin-managed public news feed. The array is the fast local snapshot;
 // Upstash keeps updates available after a Render restart when configured.
 const newsItems = [];
-let newsStoreReady = !UNIQUE_VISITOR_REMOTE_ENABLED;
+let newsStoreReady = false;
 let newsInitPromise = Promise.resolve(false);
 
 // SSE clients for admin dashboard
@@ -219,7 +241,11 @@ sseHeartbeatTimer.unref?.();
 // Heartbeat / cleanup settings
 const HEARTBEAT_TIMEOUT = Number(process.env.HEARTBEAT_TIMEOUT_MS || 60_000);
 const CLEANUP_INTERVAL = Number(process.env.CLEANUP_INTERVAL_MS || 30_000);
-const GEO_API = process.env.GEO_API || 'http://ip-api.com/json';
+const VISITOR_TOKEN_TTL_MS = Number(process.env.VISITOR_TOKEN_TTL_MS || 24 * 60 * 60 * 1000);
+const VISITOR_RATE_LIMIT_WINDOW_MS = Number(process.env.VISITOR_RATE_LIMIT_WINDOW_MS || 60_000);
+const VISITOR_RATE_LIMIT_MAX = Number(process.env.VISITOR_RATE_LIMIT_MAX || 30);
+const GEO_ENABLED = process.env.GEO_ENABLED !== 'false';
+const GEO_API = String(process.env.GEO_API || 'https://ipwho.is').replace(/\/+$/, '');
 
 // ─────────────────────────────────────────────
 // MIDDLEWARE
@@ -238,6 +264,21 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: https://media.formula1.com",
+    "connect-src 'self' https://f1free.onrender.com https://api.jolpi.ca",
+    'frame-src https:',
+    "media-src 'self' https:",
+    "form-action 'self'"
+  ].join('; '));
+  if (PRODUCTION_MODE) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   if (req.path.startsWith('/api/') || req.path.startsWith('/admin/api/') || req.path === '/healthz') {
     res.setHeader('Cache-Control', 'no-store');
   }
@@ -249,7 +290,7 @@ app.use((req, res, next) => {
 
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Visitor-Secret, X-User-Id');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Visitor-Token, X-User-Id');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
 
   if (origin && !isAllowedOrigin(req, origin)) {
@@ -268,22 +309,15 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '64kb' }));
 
-// Expiring in-memory store suits a single Render instance without the leak warning
-// of express-session's default store. Set up a shared store when scaling to many instances.
-const sessionStore = new MemoryStore({ checkPeriod: 15 * 60 * 1000 });
-const sessionMiddleware = session({
-  store: sessionStore,
-  secret: ADMIN_SECRET,
+// Stateless, signed admin sessions avoid a server-side session database. The
+// stable ADMIN_SECRET lets one admin session work across Render instances and restarts.
+const sessionMiddleware = cookieSession({
   name: 'freef1.sid',
-  resave: false,
-  saveUninitialized: false,
-  proxy: true,
-  cookie: {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production' ? 'auto' : false,
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
-  }
+  keys: [ADMIN_SECRET],
+  httpOnly: true,
+  sameSite: 'strict',
+  secure: PRODUCTION_MODE,
+  maxAge: 24 * 60 * 60 * 1000 // 24 hours
 });
 
 // ─────────────────────────────────────────────
@@ -433,7 +467,7 @@ function pruneGeoCache() {
 }
 
 async function lookupGeo(ip) {
-  if (!isPublicIp(ip) || typeof fetch !== 'function') return null;
+  if (!GEO_ENABLED || !isPublicIp(ip) || typeof fetch !== 'function') return null;
   const cached = geoCache.get(ip);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
   if (pendingGeoLookups.has(ip)) return pendingGeoLookups.get(ip);
@@ -443,13 +477,21 @@ async function lookupGeo(ip) {
     const timeout = setTimeout(() => controller.abort(), 3500);
     timeout.unref?.();
     try {
-      const res = await fetch(`${GEO_API}/${encodeURIComponent(ip)}?fields=status,city,country,countryCode,lat,lon,query&timeout=3000`, { signal: controller.signal });
+      const isIpWho = GEO_API.includes('ipwho.is');
+      const endpoint = isIpWho
+        ? `${GEO_API}/${encodeURIComponent(ip)}`
+        : `${GEO_API}/${encodeURIComponent(ip)}?fields=status,city,country,countryCode,lat,lon,query&timeout=3000`;
+      const res = await fetch(endpoint, { signal: controller.signal });
       if (!res.ok) return null;
       const data = await res.json();
-      if (data.status !== 'success') return null;
-      geoCache.set(ip, { value: data, expiresAt: Date.now() + GEO_CACHE_TTL });
+      if (isIpWho ? data.success === false : data.status !== 'success') return null;
+      const normalized = {
+        ...data,
+        countryCode: data.countryCode || data.country_code || null
+      };
+      geoCache.set(ip, { value: normalized, expiresAt: Date.now() + GEO_CACHE_TTL });
       if (geoCache.size > 5000) pruneGeoCache();
-      return data;
+      return normalized;
     } catch (_) {
       return null;
     } finally {
@@ -461,6 +503,52 @@ async function lookupGeo(ip) {
   pendingGeoLookups.set(ip, lookup);
   return lookup;
 }
+
+// ─────────────────────────────────────────────
+// SIMPLE LOCAL JSON STORAGE
+// ─────────────────────────────────────────────
+
+function initializeFileStore() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    fileStoreReady = true;
+  } catch (error) {
+    fileStoreReady = false;
+    console.warn(`[Storage] Local JSON storage unavailable at ${DATA_DIR}. ${error?.message || error}`);
+  }
+}
+
+function readLocalJson(filePath) {
+  if (!fileStoreReady || !fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    console.warn(`[Storage] Could not read ${filePath}. ${error?.message || error}`);
+    return null;
+  }
+}
+
+function writeLocalJson(filePath, value) {
+  if (!fileStoreReady) return false;
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(temporaryPath, filePath);
+    return true;
+  } catch (error) {
+    try { fs.rmSync(temporaryPath, { force: true }); } catch (_) {}
+    console.warn(`[Storage] Could not write ${filePath}. ${error?.message || error}`);
+    return false;
+  }
+}
+
+function dataStoreStatus(remoteEnabled, remoteReady) {
+  if (remoteEnabled) return remoteReady ? 'upstash' : 'upstash-connecting';
+  return fileStoreReady ? 'file' : 'memory';
+}
+
+initializeFileStore();
 
 // ─────────────────────────────────────────────
 // DURABLE UNIQUE-VISITOR COUNT
@@ -528,12 +616,28 @@ async function syncUniqueVisitorCount() {
   }
 }
 
+function loadLocalUniqueVisitors() {
+  const stored = readLocalJson(UNIQUE_VISITORS_FILE);
+  if (!Array.isArray(stored)) return false;
+  stored
+    .filter(hash => typeof hash === 'string' && /^[a-f0-9]{64}$/i.test(hash))
+    .forEach(hash => visitorKeysSeen.add(hash));
+  return true;
+}
+
+function persistLocalUniqueVisitors() {
+  return writeLocalJson(UNIQUE_VISITORS_FILE, [...visitorKeysSeen].sort());
+}
+
 async function trackUniqueVisitor(key) {
   const hash = hashVisitorKey(key);
   const firstSeenThisProcess = !visitorKeysSeen.has(hash);
   visitorKeysSeen.add(hash);
 
-  if (!UNIQUE_VISITOR_REMOTE_ENABLED) return firstSeenThisProcess;
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) {
+    if (firstSeenThisProcess) persistLocalUniqueVisitors();
+    return firstSeenThisProcess;
+  }
   if (persistedVisitorHashes.has(hash)) return false;
   if (pendingUniqueWrites.has(hash)) return pendingUniqueWrites.get(hash);
 
@@ -603,8 +707,10 @@ function applyMaintenanceState(state) {
 
 async function syncMaintenanceState() {
   if (!UNIQUE_VISITOR_REMOTE_ENABLED) {
-    maintenanceStoreReady = true;
-    return false;
+    const stored = readLocalJson(MAINTENANCE_FILE);
+    if (stored) applyMaintenanceState(stored);
+    maintenanceStoreReady = fileStoreReady;
+    return fileStoreReady;
   }
 
   try {
@@ -624,7 +730,11 @@ async function syncMaintenanceState() {
 }
 
 async function persistMaintenanceState() {
-  if (!UNIQUE_VISITOR_REMOTE_ENABLED) return false;
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) {
+    const saved = writeLocalJson(MAINTENANCE_FILE, publicMaintenanceState());
+    maintenanceStoreReady = saved;
+    return saved;
+  }
   try {
     const payload = await upstashRequest([
       'SET',
@@ -740,8 +850,14 @@ function deleteNewsRecord(id) {
 
 async function syncNewsStore() {
   if (!UNIQUE_VISITOR_REMOTE_ENABLED) {
-    newsStoreReady = true;
-    return false;
+    const stored = readLocalJson(NEWS_FILE);
+    const restored = Array.isArray(stored)
+      ? stored.map(item => normalizeNewsRecord(item)).filter(item => item.title && item.body).slice(0, NEWS_MAX_ITEMS)
+      : [];
+    newsItems.splice(0, newsItems.length, ...restored);
+    sortNewsItems();
+    newsStoreReady = fileStoreReady;
+    return fileStoreReady;
   }
 
   try {
@@ -764,7 +880,11 @@ async function syncNewsStore() {
 }
 
 async function persistNewsStore() {
-  if (!UNIQUE_VISITOR_REMOTE_ENABLED) return false;
+  if (!UNIQUE_VISITOR_REMOTE_ENABLED) {
+    const saved = writeLocalJson(NEWS_FILE, newsItems);
+    newsStoreReady = saved;
+    return saved;
+  }
   try {
     const payload = await upstashRequest(['SET', NEWS_REDIS_KEY, JSON.stringify(newsItems)]);
     if (payload?.result !== 'OK') throw new Error('Upstash did not confirm the news update');
@@ -778,7 +898,7 @@ async function persistNewsStore() {
 }
 
 function newsStoreIsDurable() {
-  return UNIQUE_VISITOR_REMOTE_ENABLED && newsStoreReady;
+  return newsStoreReady;
 }
 
 // Keep the local snapshot in sync if the service is ever scaled beyond one
@@ -791,10 +911,17 @@ if (UNIQUE_VISITOR_REMOTE_ENABLED) {
   syncUniqueVisitorCount();
   maintenanceInitPromise = syncMaintenanceState();
   newsInitPromise = syncNewsStore();
-} else if (UPSTASH_REDIS_REST_URL || UPSTASH_REDIS_REST_TOKEN) {
-  console.warn('[Visitors] Both UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are required; unique totals and maintenance mode are in-memory only.');
 } else {
-  console.warn('[Visitors] Upstash is not configured; unique totals and maintenance mode will reset when the server restarts.');
+  loadLocalUniqueVisitors();
+  maintenanceInitPromise = syncMaintenanceState();
+  newsInitPromise = syncNewsStore();
+  if (UPSTASH_REDIS_REST_URL || UPSTASH_REDIS_REST_TOKEN) {
+    console.warn('[Visitors] Both Upstash variables are required for remote persistence; using local JSON storage instead.');
+  } else if (fileStoreReady) {
+    console.log(`[Storage] Using local JSON persistence at ${DATA_DIR}. Configure Upstash or a persistent disk for deploy-safe storage.`);
+  } else {
+    console.warn('[Storage] Local JSON storage is unavailable; mutable state will remain in memory.');
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -814,6 +941,41 @@ function normalizeVisitorId(value) {
     .trim()
     .replace(/[^A-Za-z0-9_.:@-]/g, '')
     .slice(0, 128);
+}
+
+function createVisitorToken(userId) {
+  const payload = Buffer.from(JSON.stringify({
+    id: userId,
+    exp: Date.now() + VISITOR_TOKEN_TTL_MS
+  })).toString('base64url');
+  const signature = crypto.createHmac('sha256', VISITOR_SECRET).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function verifyVisitorToken(token, userId) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 2) return false;
+  const [payload, signature] = parts;
+  const expected = crypto.createHmac('sha256', VISITOR_SECRET).update(payload).digest('base64url');
+  if (!safeEqual(signature, expected)) return false;
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return normalizeVisitorId(decoded.id) === userId && Number(decoded.exp) > Date.now();
+  } catch (_) {
+    return false;
+  }
+}
+
+function consumeVisitorRateLimit(key) {
+  const now = Date.now();
+  const current = visitorRateLimits.get(key);
+  if (!current || current.resetAt <= now) {
+    visitorRateLimits.set(key, { count: 1, resetAt: now + VISITOR_RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  if (current.count >= VISITOR_RATE_LIMIT_MAX) return false;
+  current.count++;
+  return true;
 }
 
 function findVisitorKeyByIp(ip) {
@@ -929,6 +1091,7 @@ app.use(visitorTracking);
 function cleanupInactiveVisitors() {
   const now = Date.now();
   for (const [key, state] of loginAttempts) if (state.resetAt <= now) loginAttempts.delete(key);
+  for (const [key, state] of visitorRateLimits) if (state.resetAt <= now) visitorRateLimits.delete(key);
   let removed = 0;
   for (const [id, visitor] of activeUsers) {
     if (now - visitor.lastSeen > HEARTBEAT_TIMEOUT) {
@@ -999,12 +1162,9 @@ function getStats() {
       startedAt: SERVER_STARTED_AT,
       uptimeMs: now - SERVER_STARTED_AT,
       nodeEnv: process.env.NODE_ENV || 'development',
-      uniqueVisitorStore: UNIQUE_VISITOR_REMOTE_ENABLED
-        ? (uniqueVisitorStoreReady ? 'upstash' : 'upstash-connecting')
-        : 'memory',
-      maintenanceStore: UNIQUE_VISITOR_REMOTE_ENABLED
-        ? (maintenanceStoreReady ? 'upstash' : 'upstash-connecting')
-        : 'memory'
+      uniqueVisitorStore: dataStoreStatus(UNIQUE_VISITOR_REMOTE_ENABLED, uniqueVisitorStoreReady),
+      maintenanceStore: dataStoreStatus(UNIQUE_VISITOR_REMOTE_ENABLED, maintenanceStoreReady),
+      newsStore: dataStoreStatus(UNIQUE_VISITOR_REMOTE_ENABLED, newsStoreReady)
     }
   };
 }
@@ -1046,12 +1206,9 @@ app.get('/healthz', (req, res) => {
   res.json({
     ok: true,
     uptimeMs: Date.now() - SERVER_STARTED_AT,
-    uniqueVisitorStore: UNIQUE_VISITOR_REMOTE_ENABLED
-      ? (uniqueVisitorStoreReady ? 'upstash' : 'upstash-connecting')
-      : 'memory',
-    maintenanceStore: UNIQUE_VISITOR_REMOTE_ENABLED
-      ? (maintenanceStoreReady ? 'upstash' : 'upstash-connecting')
-      : 'memory'
+    uniqueVisitorStore: dataStoreStatus(UNIQUE_VISITOR_REMOTE_ENABLED, uniqueVisitorStoreReady),
+    maintenanceStore: dataStoreStatus(UNIQUE_VISITOR_REMOTE_ENABLED, maintenanceStoreReady),
+    newsStore: dataStoreStatus(UNIQUE_VISITOR_REMOTE_ENABLED, newsStoreReady)
   });
 });
 
@@ -1099,17 +1256,35 @@ app.get('/api/auth/verify', (req, res) => {
   res.status(403).json({ authorized: false, error: 'Unauthorized', message: 'Access only from ' + AUTHORIZED_DOMAIN });
 });
 
-// Visitor heartbeat used by the public site. It now updates the same object shape
+// The public site receives a short-lived, user-bound token instead of exposing
+// the visitor signing secret in browser JavaScript.
+app.get('/api/visitors/token', (req, res) => {
+  const userId = normalizeVisitorId(req.headers['x-user-id'] || req.query.userId);
+  if (!userId) return res.status(400).json({ error: 'Missing user ID' });
+  if (!consumeVisitorRateLimit(`token:${getClientIp(req)}`)) {
+    res.setHeader('Retry-After', String(Math.ceil(VISITOR_RATE_LIMIT_WINDOW_MS / 1000)));
+    return res.status(429).json({ error: 'Too many token requests. Try again later.' });
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ token: createVisitorToken(userId), expiresAt: Date.now() + VISITOR_TOKEN_TTL_MS });
+});
+
+// Visitor heartbeat used by the public site. It updates the same object shape
 // as page tracking instead of corrupting the admin visitor map with raw numbers.
 app.get('/api/visitors/heartbeat', async (req, res, next) => {
   try {
-    const secret = req.headers['x-visitor-secret'];
-    if (!safeEqual(secret, VISITOR_SECRET)) return res.status(403).json({ error: 'Forbidden' });
-
     const suppliedUserId = normalizeVisitorId(req.headers['x-user-id']);
     if (!suppliedUserId) return res.status(400).json({ error: 'Missing user ID' });
 
     const ip = getClientIp(req);
+    if (!consumeVisitorRateLimit(`heartbeat:${ip}`)) {
+      res.setHeader('Retry-After', String(Math.ceil(VISITOR_RATE_LIMIT_WINDOW_MS / 1000)));
+      return res.status(429).json({ error: 'Too many heartbeat requests. Try again later.' });
+    }
+    if (!verifyVisitorToken(req.headers['x-visitor-token'], suppliedUserId)) {
+      return res.status(403).json({ error: 'Invalid or expired visitor token' });
+    }
+
     const existingIpKey = findVisitorKeyByIp(ip);
     const key = activeUsers.has(suppliedUserId) ? suppliedUserId : (existingIpKey || suppliedUserId);
     const { entry, isNew } = upsertVisitor(key, req, {
@@ -1129,8 +1304,10 @@ app.get('/api/visitors/heartbeat', async (req, res, next) => {
 });
 
 app.get('/api/visitors/active', (req, res) => {
-  const secret = req.headers['x-visitor-secret'];
-  if (!safeEqual(secret, VISITOR_SECRET)) return res.status(403).json({ error: 'Forbidden' });
+  if (!consumeVisitorRateLimit(`active:${getClientIp(req)}`)) {
+    res.setHeader('Retry-After', String(Math.ceil(VISITOR_RATE_LIMIT_WINDOW_MS / 1000)));
+    return res.status(429).json({ error: 'Too many requests. Try again later.' });
+  }
   res.json({ active: countOnlineUsers() });
 });
 
@@ -1245,13 +1422,22 @@ app.post('/admin/api/login', checkLoginLimit, (req, res) => {
   res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
 
-app.use('/admin/api/*', sessionMiddleware, (req, res, next) => {
+function requireAdminOrigin(req, res, next) {
+  if (!['POST', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const source = normalizeOrigin(req.headers.origin || req.headers.referer || '');
+  if (PRODUCTION_MODE && !source) return res.status(403).json({ error: 'Missing request origin' });
+  if (source && !isAllowedOrigin(req, source)) return res.status(403).json({ error: 'Forbidden' });
+  next();
+}
+
+app.use('/admin/api/*', sessionMiddleware, requireAdminOrigin, (req, res, next) => {
   if (!req.session.isAdmin) return res.status(401).json({ error: 'Not authenticated' });
   next();
 });
 
 app.post('/admin/api/logout', (req, res) => {
-  req.session.destroy(() => res.json({ success: true }));
+  req.session = null;
+  res.json({ success: true });
 });
 
 app.get('/admin/api/status', (req, res) => {

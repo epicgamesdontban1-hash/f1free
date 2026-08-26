@@ -56,6 +56,7 @@ const normalStreamBtn   = $('normalStreamBtn');
 const streamPreview     = $('streamPreview');
 const sysUptime         = $('sysUptime');
 const sysVisitorStore   = $('sysVisitorStore');
+const sysNewsStore      = $('sysNewsStore');
 const sysOverrideStatus = $('sysOverrideStatus');
 const sysMaintenanceStatus = $('sysMaintenanceStatus');
 const sysNodeEnv        = $('sysNodeEnv');
@@ -387,6 +388,11 @@ function updateSystemInfo(data) {
   if (sysVisitorStore) {
     const active = data?.activeSessions ?? data?.visitors?.length ?? 0;
     sysVisitorStore.textContent = `${active} active / ${data?.totalUnique ?? '—'} unique`;
+  }
+  if (sysNewsStore) {
+    const store = String(data?.server?.newsStore || 'unknown').toUpperCase();
+    sysNewsStore.textContent = store;
+    sysNewsStore.style.color = store === 'UPSTASH' ? 'var(--green)' : store === 'FILE' ? 'var(--amber)' : '#ff6b62';
   }
   if (sysOverrideStatus) {
     sysOverrideStatus.textContent = data?.override?.active ? 'OVERRIDE' : 'NORMAL';
